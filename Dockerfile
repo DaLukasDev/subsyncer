@@ -48,6 +48,10 @@ RUN apt-get update \
  && useradd --uid 1000 --gid 1000 --no-create-home --home-dir /data --shell /usr/sbin/nologin subsyncer \
  && mkdir -p /data && chown subsyncer:subsyncer /data
 COPY --from=ffmpeg /opt/ffmpeg/bin/ffmpeg /opt/ffmpeg/bin/ffprobe /usr/local/bin/
+COPY --from=ffmpeg /tmp/ffmpeg/COPYING.LGPLv2.1 /tmp/ffmpeg/LICENSE.md /usr/share/doc/subsyncer/ffmpeg/
+COPY LICENSE-MIT LICENSE-APACHE THIRD_PARTY.md /usr/share/doc/subsyncer/
+COPY licenses /usr/share/doc/subsyncer/licenses
+COPY crates/cli/assets/LICENSE-silero-vad /usr/share/doc/subsyncer/licenses/silero-vad-LICENSE
 COPY --from=builder /usr/local/bin/subsyncer /usr/local/bin/subsyncer
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 ENV SUBSYNCER_DATA_DIR=/data \

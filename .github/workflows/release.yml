@@ -39,6 +39,8 @@ jobs:
           name="subsyncer-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir "$name"
           cp target/${{ matrix.target }}/release/subsyncer README.md LICENSE-MIT LICENSE-APACHE THIRD_PARTY.md "$name/"
+          cp -r licenses "$name/licenses"
+          cp crates/cli/assets/LICENSE-silero-vad "$name/licenses/silero-vad-LICENSE"
           tar czf "$name.tar.gz" "$name"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
       - uses: actions/upload-artifact@v4
