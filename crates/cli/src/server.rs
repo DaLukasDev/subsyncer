@@ -173,8 +173,7 @@ async fn require_api_key(State(app): State<Arc<App>>, headers: HeaderMap, req: R
     if let Some(key) = &app.cfg.api_key {
         let given = headers.get("x-api-key").and_then(|v| v.to_str().ok()).unwrap_or("");
         if !constant_time_eq(given.as_bytes(), key.as_bytes()) {
-            return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "missing or invalid X-Api-Key" })))
-                .into_response();
+            return reject(StatusCode::UNAUTHORIZED, "missing or invalid X-Api-Key");
         }
     }
     next.run(req).await
@@ -216,8 +215,17 @@ fn de_boolish<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<bool>, D:
     })
 }
 
+/// Answer a rejected request with `{"error": ...}` and log why. With
+/// `curl -f` (as in the Bazarr command) the body isn't shown in Bazarr's log,
+/// so subsyncer's log is where users find the reason.
+fn reject(status: StatusCode, msg: impl Into<String>) -> Response {
+    let msg = msg.into();
+    warn!(status = status.as_u16(), "request rejected: {msg}");
+    (status, Json(json!({ "error": msg }))).into_response()
+}
+
 fn bad_request(msg: impl Into<String>) -> Response {
-    (StatusCode::BAD_REQUEST, Json(json!({ "error": msg.into() }))).into_response()
+    reject(StatusCode::BAD_REQUEST, msg)
 }
 
 async fn post_sync(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> Response {
@@ -245,11 +253,7 @@ async fn post_sync(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes)
     for (what, p, orig) in [("video", &video_path, &video), ("subtitle", &sub_path, &subtitle)] {
         if !p.is_file() {
             let mapped = if p.as_os_str() != orig.trim() { format!(" (mapped from {orig})") } else { String::new() };
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({ "error": format!("{what} not found: {}{mapped}", p.display()) })),
-            )
-                .into_response();
+            return reject(StatusCode::UNPROCESSABLE_ENTITY, format!("{what} not found: {}{mapped}", p.display()));
         }
     }
     let dry_run = body.dry_run.unwrap_or(false);
@@ -262,7 +266,7 @@ async fn post_sync(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes)
                 .into_response();
         }
         if q.len() >= MAX_QUEUE {
-            return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": "queue full" }))).into_response();
+            return reject(StatusCode::SERVICE_UNAVAILABLE, "queue full");
         }
     }
     let id = match app.cache.insert_job(
