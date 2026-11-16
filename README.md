@@ -1,277 +1,304 @@
 # subsyncer
 
-Syncs subtitle files to video. A drop-in replacement for Bazarr's built-in
-sync (ffsubsync), shipped as a single binary and a Docker image. Bazarr calls
-it through its custom post-processing command.
+[![CI](https://github.com/DaLukasDev/subsyncer/actions/workflows/ci.yml/badge.svg)](https://github.com/DaLukasDev/subsyncer/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-| ffsubsync problem | subsyncer |
+**subsyncer fixes subtitles that are out of sync with your video.** It listens
+to the dialogue in the video, compares it with the subtitle's timing, and
+shifts the subtitle so lines appear when people actually speak.
+
+It is built to replace [Bazarr](https://www.bazarr.media/)'s built-in sync.
+Bazarr hands every subtitle it downloads to subsyncer, which fixes it in the
+background. You can also run it by hand on single files or a whole library.
+
+It handles:
+
+- subtitles that are a few seconds, up to a minute, **early or late**;
+- subtitles made for a **different frame rate** (e.g. 25 vs 23.976 fps) that
+  drift further off as the episode goes on;
+- videos with an **extra ad break, recap or a different cut**, where only part
+  of the subtitle is off;
+- **SRT, ASS/SSA and WebVTT** in any text encoding. Only timestamps change;
+  styling and text stay exactly as they were.
+
+It **leaves a subtitle alone when it's already right, or when it isn't sure**,
+so a sync never makes a good subtitle worse. When it does change a file, the
+original is kept as `<subtitle>.bak`.
+
+### Why not Bazarr's built-in sync (ffsubsync)?
+
+| ffsubsync | subsyncer |
 |---|---|
-| Weak voice detection, confused by music and effects | Silero VAD on the **centre channel** when the audio has one (dialogue lives there) |
-| One global offset + framerate fix | Global offset/framerate, then **piecewise alignment** with splits (ad breaks, recaps, different cuts) |
-| Ignores embedded subtitle tracks | Uses an embedded text track as the reference when it's usable |
-| Can make good subtitles worse | **Quality gate**: writes only when confident *and* measurably better |
-| Re-decodes audio for every subtitle | Speech timeline **cached** per media file (SQLite) |
+| Voice detection gets confused by music and effects | Neural voice detection (Silero VAD), listening to the centre channel where dialogue lives |
+| One shift for the whole file | Also fixes files where only part is off (ad breaks, different cuts) |
+| Ignores subtitle tracks already inside the video | Uses them as a precise reference when available |
+| Can make a correct subtitle worse | Writes only when it's confident and the result is measurably better |
+| Decodes the audio again for every subtitle | Remembers each video, so the second language is instant |
 
-## Bazarr setup
+## Quick start with Bazarr
 
-1. Run subsyncer next to Bazarr (see [`docker-compose.example.yml`](docker-compose.example.yml)).
-   Mount your media at the **same paths** as in Bazarr, or translate them with
-   `SUBSYNCER_PATH_MAP`.
-2. In Bazarr, **Settings → Subtitles**:
-   - turn **off** *Automatic Subtitles Synchronization*;
-   - turn **on** *Custom Post-Processing* and set the command to:
+You need Docker with Compose, and Bazarr running in Docker on the same machine.
+
+> **Note:** prebuilt images aren't published yet. Until they are, Compose
+> builds the image from this repository, which takes a few minutes the first
+> time.
+
+### 1. Add subsyncer next to Bazarr
+
+Add this service to the `docker-compose.yml` that runs Bazarr (full example:
+[`docker-compose.example.yml`](docker-compose.example.yml)):
+
+```yaml
+  subsyncer:
+    build: https://github.com/DaLukasDev/subsyncer.git#main
+    image: subsyncer:local
+    environment:
+      - PUID=1000      # the user that owns your media files (same as Bazarr's)
+      - PGID=1000
+    volumes:
+      - ./subsyncer/data:/data
+      - /srv/media/movies:/movies   # mount media at the SAME paths as Bazarr
+      - /srv/media/tv:/tv
+    restart: unless-stopped
+```
+
+The important part is the media volumes: subsyncer must see the files at **the
+same paths as Bazarr does**. If it can't, see
+[troubleshooting](#troubleshooting).
+
+Start it:
+
+```sh
+docker compose up -d subsyncer
+docker compose logs subsyncer    # should end with "subsyncer listening"
+```
+
+### 2. Point Bazarr at it
+
+In Bazarr, go to **Settings → Subtitle Processing**:
+
+1. Under **Audio Synchronization**, turn **off** *Enable Automatic Subtitles
+   Audio Synchronization*. subsyncer takes over this job.
+2. Under **Custom Post-Processing**, turn on *Custom Post-Processing* and set
+   **Command** to exactly:
 
    ```sh
    sh -c 'curl -fsS -X POST --data-urlencode "video=$1" --data-urlencode "subtitle=$2" http://subsyncer:8080/sync' _ "{{episode}}" "{{subtitles}}"
    ```
 
-   - leave the post-processing score threshold **off**, so every download is checked.
+3. Leave both *Score Threshold For Post-Processing* options **off**, so every
+   download gets checked.
+4. Save.
 
-   With `SUBSYNCER_API_KEY` set, add `-H "X-Api-Key: <key>"` after `-fsS`.
+The command looks odd for a reason: it's the form that survives file names
+with spaces, quotes and apostrophes in all current Bazarr versions
+([details](docs/how-it-works.md#the-bazarr-command)).
 
-Why it has this shape: since v1.6 Bazarr shell-splits the command, substitutes a
-`{{variable}}` only when it is a whole argument, and runs it without a shell. A
-plain `curl ... --data-urlencode "video={{episode}}"` would therefore send the
-literal text `{{episode}}`. Here Bazarr passes the paths as `$1`/`$2` to `sh`,
-so they are never parsed as shell code. Paths with spaces, quotes, `$` or
-apostrophes are safe. The script must not start or end with a `"`, because
-Bazarr strips those from each argument. The same command also works on older
-Bazarr versions that substituted into a shell string.
+### 3. Check that it works
 
-Verified against `lscr.io/linuxserver/bazarr` v1.6.2, which includes `curl`
-and `sh`. [`scripts/e2e-bazarr.sh`](scripts/e2e-bazarr.sh) reproduces the hook
-end to end: it runs Bazarr's own `pp_replace()` and `postprocessing()` against
-a subsyncer container.
+Download or search a subtitle in Bazarr, then:
 
-Bazarr's log shows the response, e.g.
-`Post-processing result ...: {"job_id":12,"status":"queued","deduplicated":false}`.
-The outcome is available at `GET /jobs/12` and in subsyncer's log.
+- Bazarr's log (**System → Logs**) shows a line like
+  `Post-processing result for file ...: {"job_id":1,"status":"queued",...}`;
+- `docker compose logs subsyncer` shows the job, for example
+  `job finished job=1 outcome="synced" offset_ms=-7300`.
 
-## CLI
+That's it. From now on every subtitle Bazarr downloads is checked and, if
+needed, fixed.
+
+## What the results mean
+
+| outcome | what happened to your file |
+|---|---|
+| `synced` | It was out of sync and has been fixed. The original is in `<subtitle>.bak`. |
+| `already_synced` | It was already in sync. Not touched. |
+| `low_confidence` | subsyncer couldn't tell for sure (little dialogue, music-heavy audio, or a subtitle for a different version). Not touched. |
+| `failed` | Something went wrong, e.g. the video has no audio or the file couldn't be read. The reason is in the log. Not touched. |
+
+**To undo a change**, put the backup back:
+`mv "Movie.en.srt.bak" "Movie.en.srt"`.
+
+## Using it without Bazarr
+
+The same image doubles as a command-line tool. Mount your media and pass a
+command:
+
+```sh
+# Fix one subtitle (add --dry-run to only see what it would do)
+docker run --rm -e PUID=$(id -u) -e PGID=$(id -g) -v /srv/media:/media subsyncer:local \
+  sync "/media/movies/Movie (2010)/Movie (2010).mkv" "/media/movies/Movie (2010)/Movie (2010).en.srt"
+
+# Check a whole library; pairs each subtitle with the video it belongs to
+docker run --rm -e PUID=$(id -u) -e PGID=$(id -g) -v /srv/media:/media -v ./subsyncer/data:/data subsyncer:local \
+  scan /media --dry-run
+```
+
+To build the image without Compose, run
+`docker build -t subsyncer:local https://github.com/DaLukasDev/subsyncer.git#main`.
+
+Example output:
+
+```
+Movie (2010).en.srt: synced
+  reference audio:1 | offset -0.010s | splits 1 | speech overlap 0.413 -> 0.621 | confidence 10.1
+    from    23.000s  offset +0.100s  (35 cues)
+    from   332.500s  offset -29.880s  (41 cues)
+  speech overlap 0.413 -> 0.621
+  wrote Movie (2010).en.srt (backup Movie (2010).en.srt.bak)
+```
+
+Here the first part of the subtitle needed nothing, and from 5:32 on it was
+30 seconds late, as if the subtitle came from a version with an extra scene.
+
+All commands:
 
 ```sh
 subsyncer sync <video> <subtitle> [--reference auto|audio|embedded] [--dry-run] [--output <path>] [--no-backup] [--json]
 subsyncer scan <dir> [--dry-run] [--force] [--include-forced] [--json]
-subsyncer serve            # HTTP daemon (see below)
-subsyncer health           # exit 0 if the daemon's /healthz answers (container healthcheck)
+subsyncer serve     # the HTTP service Bazarr talks to (the image's default)
+subsyncer health    # exits 0 if the service is up (used by the Docker healthcheck)
 ```
 
-`sync` exits with 0 for `synced`/`already_synced`, 2 for `low_confidence` and 1
-for `failed`.
-
-`scan` pairs each subtitle with the video whose name it extends (`Movie.mkv` ←
-`Movie.en.srt`, `Movie.srt`). It skips `*.forced.*` unless `--include-forced` is
-given, and records processed pairs in SQLite, so re-runs only touch new or
-changed files. Failures are retried on the next scan.
-
-Example:
-
-```
-$ subsyncer sync movie.mkv movie.nl.srt
-movie.nl.srt: synced
-  reference audio:1 | offset -0.010s | splits 1 | speech overlap 0.413 -> 0.621 | confidence 15.4
-    from    23.000s  offset +0.100s  (35 cues)
-    from   332.500s  offset -29.880s  (41 cues)
-  speech overlap 0.413 -> 0.621
-  wrote movie.nl.srt (backup movie.nl.srt.bak)
-```
-
-## HTTP API (`serve`)
-
-| Endpoint | |
-|---|---|
-| `POST /sync` | JSON or form-encoded: `video`, `subtitle`, optional `reference` (`auto`/`audio`/`embedded`), `dry_run`. Returns **202** `{"job_id", "status", "deduplicated"}`. A request for a subtitle that is still waiting in the queue returns the existing job. Missing files return **422** with the mapped path. |
-| `GET /jobs/{id}` | `status` (`queued`/`running`/`done`), `outcome`, `reason`, `offset_ms`, `ratio`, `splits`, `score_before`, `score_after`, `prominence`, and the full `result` report. |
-| `GET /jobs?limit=50&status=done` | Recent jobs, newest first. |
-| `GET /healthz` | `{"status":"ok","queued":..,"running":..}`. No auth. |
-
-If `SUBSYNCER_API_KEY` is set, every endpoint except `/healthz` requires `X-Api-Key`.
-Jobs run on a bounded worker pool. Jobs still queued or running at shutdown are
-re-queued on the next start.
+`scan` remembers what it already processed, so running it again only looks at
+new or changed files. It skips forced subtitles (`*.forced.*`) unless you pass
+`--include-forced`. `sync` exits with 0 for `synced`/`already_synced`, 2 for
+`low_confidence` and 1 for `failed`.
 
 ## Configuration
 
-All options are environment variables (or the matching `--flag`):
+Everything is set with environment variables. Most setups need none besides
+`PUID`/`PGID`.
 
-| Variable | Default | |
+| Variable | Default | What it does |
 |---|---|---|
-| `SUBSYNCER_LISTEN` | `0.0.0.0:8080` | `serve` listen address |
-| `SUBSYNCER_WORKERS` | `1` | concurrent jobs (decoding + VAD is CPU-heavy) |
-| `SUBSYNCER_DATA_DIR` | `/data` | SQLite cache + job history; outside Docker it falls back to `~/.cache/subsyncer` |
-| `SUBSYNCER_PATH_MAP` | | `/bazarr/path=/local/path,...` (longest prefix wins) |
-| `SUBSYNCER_BACKUP` | `true` | keep `<subtitle>.bak` when overwriting |
-| `SUBSYNCER_MAX_OFFSET_SECS` | `60` | global offset search range (±) |
-| `SUBSYNCER_WINDOW_SECS` | `60` | piecewise search window around the global result (±) |
-| `SUBSYNCER_SPLIT_PENALTY` | `2000` | cost of a split (higher means fewer splits) |
-| `SUBSYNCER_NO_SPLITS` | `false` | global offset + framerate only |
-| `SUBSYNCER_MIN_CONFIDENCE` | `6.0` | minimum correlation-peak prominence to write |
-| `SUBSYNCER_MIN_IMPROVEMENT` | `0.01` | minimum gain in speech overlap to write |
-| `SUBSYNCER_API_KEY` | | require `X-Api-Key` |
-| `SUBSYNCER_LOG_LEVEL` | `info` | `error`…`trace` or a tracing filter |
+| `PUID`, `PGID` | `1000`, `1000` | User and group that subsyncer runs as and that owns the files it writes |
+| `UMASK` | `002` | File creation mask inside the container |
+| `SUBSYNCER_PATH_MAP` | | Translate paths Bazarr sends: `/bazarr/path=/subsyncer/path,...` |
+| `SUBSYNCER_API_KEY` | | Require an `X-Api-Key` header. Add `-H "X-Api-Key: <key>"` after `-fsS` in the Bazarr command. |
+| `SUBSYNCER_BACKUP` | `true` | Keep `<subtitle>.bak` when changing a file |
+| `SUBSYNCER_WORKERS` | `1` | How many subtitles to process at once. Each one uses about one CPU core while decoding. |
+| `SUBSYNCER_LOG_LEVEL` | `info` | `error`, `warn`, `info`, `debug` or `trace` |
 | `SUBSYNCER_LOG_FORMAT` | `text` | `text` or `json` |
-| `SUBSYNCER_FFMPEG`, `SUBSYNCER_FFPROBE` | `ffmpeg`, `ffprobe` | binaries (run as subprocesses, never linked) |
-| `PUID`, `PGID`, `UMASK` | `1000`, `1000`, `002` | Docker only: the user that runs subsyncer and owns written files |
+| `SUBSYNCER_LISTEN` | `0.0.0.0:8080` | Address of the HTTP service |
+| `SUBSYNCER_DATA_DIR` | `/data` | Where the cache and job history live. Outside Docker it falls back to `~/.cache/subsyncer`. |
+
+Tuning (the defaults come from the [evaluation](docs/evaluation.md)):
+
+| Variable | Default | What it does |
+|---|---|---|
+| `SUBSYNCER_MAX_OFFSET_SECS` | `60` | Largest overall shift searched for (±) |
+| `SUBSYNCER_WINDOW_SECS` | `60` | How far a part of the file may shift from the overall result (±) |
+| `SUBSYNCER_SPLIT_PENALTY` | `2000` | Higher values make subsyncer more reluctant to split a file into parts |
+| `SUBSYNCER_NO_SPLITS` | `false` | Only ever apply one shift (plus frame-rate correction) |
+| `SUBSYNCER_MIN_CONFIDENCE` | `6.0` | How sure it must be before writing |
+| `SUBSYNCER_MIN_IMPROVEMENT` | `0.01` | How much better the result must be before writing |
+| `SUBSYNCER_FFMPEG`, `SUBSYNCER_FFPROBE` | `ffmpeg`, `ffprobe` | FFmpeg binaries, outside Docker |
+
+## Troubleshooting
+
+#### Bazarr logs `curl: (22) ... error: 422`
+
+subsyncer can't find the file at the path Bazarr sent. `docker compose logs
+subsyncer` shows which one, e.g. `request rejected: video not found:
+/tv/Show/S01E01.mkv`. Mount your media at the same paths in both containers,
+or translate them. For example, if Bazarr sees `/tv` and subsyncer has the same
+folder mounted at `/media/tv`:
+
+```yaml
+      - SUBSYNCER_PATH_MAP=/tv=/media/tv
+```
+
+#### Bazarr logs `curl: (22) ... error: 401`
+
+`SUBSYNCER_API_KEY` is set but the Bazarr command doesn't send it. Add
+`-H "X-Api-Key: <key>"` after `-fsS`.
+
+#### Bazarr logs `curl: (6) Could not resolve host: subsyncer`
+
+Bazarr can't reach the container. Both services must be in the same Compose
+file or Docker network, and the URL must use the service name (`subsyncer`).
+
+#### Nothing happens after a download
+
+Check that *Custom Post-Processing* is on and that the score threshold options
+are off. Then look at Bazarr's log for a `Post-processing result` line.
+
+#### Everything comes back `low_confidence`
+
+Usually the subtitle belongs to a different release of the video, or the audio
+has very little dialogue. Run it by hand with `--dry-run --log-level debug` to
+see the details. If the video contains its own subtitle track, try
+`--reference embedded`.
+
+#### Files are owned by the wrong user
+
+Set `PUID`/`PGID` to the user and group that own your media (`id youruser`
+shows them).
+
+#### It's slow
+
+The first subtitle for a video takes roughly 5–10 seconds per 45-minute
+episode on a modern CPU, mostly listening to the audio. Later subtitles for the same video reuse the result and
+take well under a second. Keep `/data` on a volume so the cache survives
+restarts.
 
 ## How it works
 
-All timelines are boolean arrays on a 10 ms grid.
+In short:
+1. subsyncer builds a "who is speaking when" timeline for the video, from a
+   subtitle track inside the video or by listening to the audio with a neural
+   voice detector.
+2. It compares that with the subtitle's timing, trying different frame rates.
+3. If only parts of the file are off, it finds where they start and shifts each
+   part separately.
+4. A quality check decides whether the result is trustworthy enough to write.
 
-1. **Probe** streams with `ffprobe`.
-2. **Reference timeline.**
-   - *Embedded*: the text subtitle track (subrip, ass, mov_text, webvtt) with the
-     most dialogue cues. Forced/signs tracks are skipped: those with the forced
-     flag, "forced"/"signs" in the title, or fewer than 50% of the target's cues.
-   - *Audio*: the default audio stream decoded by ffmpeg to 16 kHz mono. If the
-     layout has a centre channel, that channel is used alone (`pan=mono|c0=FC`).
-     Silero VAD v6 runs on 512-sample windows with its state carried between
-     windows, and the result goes through hysteresis thresholding (0.5/0.35),
-     gap filling, and resampling to 10 ms. The model is embedded in the binary.
-3. **Cues.** Sound descriptions (`[door slams]`), music (`♪ ... ♪`), ASS
-   comments, drawings and sign lines are left out of alignment. They still move
-   with their neighbours.
-4. **Global alignment.** FFT cross-correlation of ±1 signals for framerate ratios
-   1, 25/23.976, 24/25, 24/23.976 and their inverses. Confidence is the z-score
-   of the peak on a detrended correlation curve.
-5. **Piecewise alignment.** A DP over (cue, offset): each cue scores +1 per
-   speech frame and −λ per non-speech frame (O(1) via prefix sums), and starting
-   a new segment costs `SPLIT_PENALTY`. A backward jump larger than the dialogue
-   gap at that point also pays for the overlap it creates, because real cuts sit
-   in gaps. The offset range covers every strong correlation peak and widens if
-   a segment lands on its edge. Ratio 1 and the best other ratio are both run
-   through the DP, and its objective decides between them. After that:
-   - short or near-identical segments are merged;
-   - **each segment must have its own sharp correlation peak**, otherwise it is
-     merged into a neighbour;
-   - overlaps from removed content are collapsed so cues stay in order.
-6. **Quality gate.**
-   - `already_synced`: nothing moves by 100 ms or more, or a correction of at
-     most 300 ms gives no measurable gain.
-   - `low_confidence`: the peak isn't prominent enough, or the overlap doesn't
-     improve enough. Nothing is written.
-   - `synced`: written. `failed`: an error, e.g. no audio or an unparsable file.
-7. **Write.** Only timestamp bytes change. Encoding (UTF-8, UTF-16 and legacy
-   code pages via chardetng), BOM, line endings and all styling are preserved,
-   and an unshifted file renders byte-identical. The file is written to a temp
-   file in the same directory, then renamed over the original. The previous
-   version is kept as `.bak`.
+Details: [docs/how-it-works.md](docs/how-it-works.md). Accuracy measurements:
+[docs/evaluation.md](docs/evaluation.md). On synthetic tests, 99.6% of lines
+end up within 200 ms of the right time, and subtitles that belong to a
+different video are never changed. HTTP API: [docs/http-api.md](docs/http-api.md).
 
-Formats: SRT, WebVTT (including inline karaoke timestamps) and ASS/SSA.
+## Building from source
 
-## Evaluation
-
-`crates/eval` is the evaluation harness:
+You need Rust 1.88 or newer, plus `ffmpeg` and `ffprobe` on `PATH` at runtime.
+The first build downloads ONNX Runtime and needs internet access.
 
 ```sh
-cargo run --release -p subsyncer-eval -- synthetic --seeds 60 --compare [--hard]
-cargo run --release -p subsyncer-eval -- corpus /path/to/videos-with-good-subs [--baselines]
+git clone https://github.com/DaLukasDev/subsyncer.git
+cd subsyncer
+cargo build --release -p subsyncer        # binary: target/release/subsyncer
+docker build -t subsyncer:local .         # or the Docker image
 ```
 
-**Synthetic** scenarios need no media and run in CI. Each one generates a
-speech track, derives subtitle cues with realistic lead-in/out habits, adds VAD
-noise (misses, false alarms, jitter), applies a perturbation and measures
-recovery. Results for 60 episodes per row (`<=200ms` is the share of cues
-within 200 ms of the truth in the output the user gets):
+The binary needs glibc 2.38 or newer (Ubuntu 24.04+, Debian 13+, Fedora 39+).
 
-| perturbation | global only | piecewise | piecewise, hard noise¹ |
-|---|---|---|---|
-| already in sync (must be left untouched) | 100% (0 rewritten) | 100% (0 rewritten) | 100% (0 rewritten) |
-| offset 0.3–1.5 s | 100% | 100% | 100% |
-| offset 2–55 s | 100% | 100% | 100% |
-| framerate mismatch + offset | 100% | 100% | 100% |
-| video has an extra chunk (ad break) | 65.6% | **99.3%** | 98.5% |
-| two extra chunks | 42.7% | **98.6%** | 97.2% |
-| subtitle has extra content | 64.5% | **99.4%** | 98.9% |
-| framerate + extra chunk | 65.2% | **99.3%** | 98.8% |
-| subtitle for a different video (must not be written) | 0 of 60 rewritten | 0 of 60 rewritten | 0 of 60 rewritten |
+## Contributing
 
-¹ 30% of utterances missed by VAD, 3 false alarms per minute, 12% untranslated
-lines, 8% sound-description cues.
-
-Alignment takes about 0.3 s per episode on top of decoding. VAD on a 12-minute
-film takes about 2.4 s on one core; cache hits skip it.
-
-**Real corpus mode** takes a folder of videos with known-good subtitles next to
-them, perturbs the subtitles (offsets, framerate, inserted and removed chunks),
-re-syncs them, and reports the median absolute cue error and the share of cues
-within 200 ms. With `--baselines` it also runs `ffsubsync` and `alass` when
-they are on PATH (as processes, never linked).
-
-Tested on *Tears of Steel* (CC-BY, Blender Foundation) with its official
-subtitles:
-- ±offsets, both 25↔23.976 directions and a 30 s split were recovered.
-- All 76 cues landed within 200 ms after a split.
-- The untouched subtitle and its translations (de, nl, ja, ru) are
-  `already_synced`.
-- Against the 5.1 track, the centre channel finds 13.3% speech versus 7.9% for
-  a downmix.
-
-Corpus mode on that film alone (4 perturbations per row), cues within 200 ms:
-
-| offsets, framerate | extra chunk | two extra chunks | removed content | framerate + chunk |
-|---|---|---|---|---|
-| 100% | 98% | 91% | 85% | 71% |
-
-Chunk recovery is weaker here than on the synthetic episodes. The film has only
-76 cues in 12 minutes, so segments often have too few cues to pass the
-per-segment confidence check, and the result falls back to fewer splits.
-Calibrating on a corpus of real TV episodes is the next tuning step.
-
-Subtitles typically start about 180 ms before the speech onset that VAD
-detects and end about 60 ms after it, so audio-referenced corrections carry a
-lead-in bias of roughly +100 ms. The gate treats corrections that small as
-already synced.
-
-## Docker
+Issues and pull requests are welcome. Before sending a change, run:
 
 ```sh
-docker run -d --name subsyncer -e PUID=1000 -e PGID=1000 \
-  -v ./data:/data -v /srv/media/tv:/tv ghcr.io/dalukasdev/subsyncer:latest
-```
-
-The image runs subsyncer as `PUID:PGID` (it uses `tini` and `gosu`, or runs
-directly under `docker --user`). It has a `HEALTHCHECK` on `/healthz` and a
-volume at `/data`. Images are built for amd64 and arm64.
-
-The image is **Debian 13 slim** (~136 MB). The prebuilt ONNX Runtime 1.31 is
-linked into the binary. FFmpeg is a minimal static 8.1 build made from source by
-[`docker/build-ffmpeg.sh`](docker/build-ffmpeg.sh): every demuxer, native audio
-decoders and text subtitle codecs, and no video, GPU or X11 libraries. That is
-19 MB instead of the ~450 MB Debian's `ffmpeg` package pulls in. An audio
-codec outside that set fails with a clear ffmpeg error.
-
-Images that were measured and rejected:
-
-| image | size | VAD on 12 min of audio |
-|---|---|---|
-| **Debian slim + minimal FFmpeg (used)** | **136 MB** | **~1.8 s** |
-| Alpine (musl, Alpine's ONNX Runtime 1.23 and ffmpeg) | 209 MB | ~2.85 s |
-| Debian slim + Debian's `ffmpeg` package | 566 MB | ~1.95 s |
-
-Bookworm doesn't work, because the prebuilt ONNX Runtime needs glibc ≥ 2.38.
-
-## Building
-
-```sh
-cargo build --release -p subsyncer     # needs network once: ort downloads ONNX Runtime
+cargo fmt --all
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-ONNX Runtime is linked statically, so the binary depends only on
-glibc/libstdc++. Release binaries need **glibc ≥ 2.38 and the libstdc++ from
-GCC 13+** (Ubuntu 24.04+, Debian 13+, Fedora 39+), the floor set by the
-prebuilt ONNX Runtime. FFmpeg (`ffmpeg`, `ffprobe`) must be on PATH at runtime.
-
-Workspace layout:
-- `crates/core`: parsers, alignment, scoring. Pure: no IO, no ffmpeg.
-- `crates/cli`: the `subsyncer` binary, covering ffmpeg/ffprobe, VAD, HTTP, cache and config.
-- `crates/eval`: the evaluation harness.
-
-GitHub Actions:
-- `ci.yml`: fmt, clippy, tests and the synthetic eval report.
-- `docker.yml`: multi-arch GHCR images built on native amd64 and arm64 runners.
-- `release.yml`: binaries attached to the GitHub release.
+If you touch the alignment, include the before/after numbers from
+`cargo run --release -p subsyncer-eval -- synthetic --seeds 60 --compare`
+(see [docs/evaluation.md](docs/evaluation.md)). Results from real videos with
+known-good subtitles (`subsyncer-eval corpus`) are especially valuable.
 
 ## License
 
-MIT OR Apache-2.0. The binary embeds the Silero VAD model (MIT) and links ONNX
-Runtime (MIT); see [THIRD_PARTY.md](THIRD_PARTY.md).
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.
+
+subsyncer includes the Silero VAD model (MIT), ONNX Runtime (MIT) and, in the
+Docker image, an LGPL build of FFmpeg. See [THIRD_PARTY.md](THIRD_PARTY.md).
