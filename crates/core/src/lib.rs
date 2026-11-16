@@ -3,11 +3,13 @@
 //! Pure library: no file system, no subprocesses. All timelines are boolean
 //! arrays on a 10 ms grid (see [`timeline`]).
 
+pub mod align;
 pub mod classify;
 pub mod encoding;
 pub mod subtitle;
 pub mod timeline;
 
+pub use align::{AlignConfig, Alignment, Mapping};
 pub use subtitle::{Format, SubtitleFile, TsKind};
 pub use timeline::{Interval, Timeline};
 
