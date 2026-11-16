@@ -2,5 +2,6 @@
 //! HTTP API and library scanning around `subsyncer-core`.
 
 pub mod cache;
+pub mod engine;
 pub mod media;
 pub mod vad;
