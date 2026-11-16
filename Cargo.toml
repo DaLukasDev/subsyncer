@@ -7,6 +7,9 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.88"
+repository = "https://github.com/DaLukasDev/subsyncer"
+keywords = ["subtitles", "sync", "bazarr", "srt", "vad"]
+categories = ["multimedia", "command-line-utilities"]
 
 [workspace.dependencies]
 subsyncer-core = { path = "crates/core" }
