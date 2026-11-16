@@ -1,0 +1,40 @@
+[workspace]
+resolver = "3"
+members = ["crates/core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.88"
+
+[workspace.dependencies]
+subsyncer-core = { path = "crates/core" }
+anyhow = "1.0.104"
+thiserror = "2.0.21"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+rustfft = "6.4.1"
+encoding_rs = "0.8.44"
+chardetng = "1.0.0"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "signal", "net", "time"] }
+axum = "0.8.9"
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "tracing", "download-binaries", "tls-rustls", "api-22"] }
+rusqlite = { version = "0.43.0", features = ["bundled"] }
+tempfile = "3.27.0"
+walkdir = "2.5.0"
+serde_urlencoded = "0.7.1"
+
+# The alignment code is numeric; keep tests fast in debug builds.
+[profile.dev.package.subsyncer-core]
+opt-level = 3
+[profile.dev.package.rustfft]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
