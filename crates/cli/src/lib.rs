@@ -6,5 +6,6 @@ pub mod config;
 pub mod engine;
 pub mod logging;
 pub mod media;
+pub mod scan;
 pub mod server;
 pub mod vad;
