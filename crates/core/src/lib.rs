@@ -3,6 +3,7 @@
 //! Pure library: no file system, no subprocesses. All timelines are boolean
 //! arrays on a 10 ms grid (see [`timeline`]).
 
+pub mod encoding;
 pub mod timeline;
 
 pub use timeline::{Interval, Timeline};
