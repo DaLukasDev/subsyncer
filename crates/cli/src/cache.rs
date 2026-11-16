@@ -1,0 +1,282 @@
+//! SQLite store in DATA_DIR: cached reference timelines, job history and
+//! library scan state.
+
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, Result};
+use rusqlite::{Connection, OptionalExtension, params};
+use subsyncer_core::Timeline;
+
+pub struct Cache {
+    conn: Mutex<Connection>,
+    path: PathBuf,
+}
+
+/// Identity of a media file for cache keys.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileKey {
+    pub path: String,
+    pub size: i64,
+    pub mtime_ns: i64,
+}
+
+impl FileKey {
+    pub fn of(path: &Path) -> Result<Self> {
+        let meta = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+        let mtime_ns = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        Ok(Self { path: canon.to_string_lossy().into_owned(), size: meta.len() as i64, mtime_ns })
+    }
+}
+
+pub fn now_secs() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// A persisted job row.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct JobRow {
+    pub id: i64,
+    pub video: String,
+    pub subtitle: String,
+    pub reference: String,
+    pub dry_run: bool,
+    pub status: String,
+    pub created_at: i64,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
+    pub result: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ScanState {
+    pub sub_size: i64,
+    pub sub_mtime_ns: i64,
+    pub video_size: i64,
+    pub video_mtime_ns: i64,
+    pub outcome: String,
+}
+
+impl Cache {
+    pub fn open(dir: &Path) -> Result<Self> {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating data dir {}", dir.display()))?;
+        let path = dir.join("subsyncer.db");
+        let conn = Connection::open(&path).with_context(|| format!("opening {}", path.display()))?;
+        conn.busy_timeout(std::time::Duration::from_secs(10))?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS timelines (
+                path TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                mtime_ns INTEGER NOT NULL,
+                stream INTEGER NOT NULL,
+                version TEXT NOT NULL,
+                frames INTEGER NOT NULL,
+                data BLOB NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (path, size, mtime_ns, stream, version)
+            );
+            CREATE TABLE IF NOT EXISTS jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                video TEXT NOT NULL,
+                subtitle TEXT NOT NULL,
+                reference TEXT NOT NULL,
+                dry_run INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                started_at INTEGER,
+                finished_at INTEGER,
+                result TEXT
+            );
+            CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status);
+            CREATE TABLE IF NOT EXISTS scan_state (
+                subtitle TEXT PRIMARY KEY,
+                sub_size INTEGER NOT NULL,
+                sub_mtime_ns INTEGER NOT NULL,
+                video TEXT NOT NULL,
+                video_size INTEGER NOT NULL,
+                video_mtime_ns INTEGER NOT NULL,
+                outcome TEXT NOT NULL,
+                processed_at INTEGER NOT NULL
+            );",
+        )?;
+        Ok(Self { conn: Mutex::new(conn), path })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn get_timeline(&self, key: &FileKey, stream: usize, version: &str) -> Result<Option<Timeline>> {
+        let conn = self.conn();
+        let blob: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT data FROM timelines WHERE path=?1 AND size=?2 AND mtime_ns=?3 AND stream=?4 AND version=?5",
+                params![key.path, key.size, key.mtime_ns, stream as i64, version],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match blob {
+            Some(b) => Ok(Some(Timeline::decode_rle(&b)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn put_timeline(&self, key: &FileKey, stream: usize, version: &str, tl: &Timeline) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        // Drop entries for older versions of the same file.
+        tx.execute(
+            "DELETE FROM timelines WHERE path=?1 AND stream=?2 AND version=?3",
+            params![key.path, stream as i64, version],
+        )?;
+        tx.execute(
+            "INSERT OR REPLACE INTO timelines (path,size,mtime_ns,stream,version,frames,data,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![key.path, key.size, key.mtime_ns, stream as i64, version, tl.len() as i64, tl.encode_rle(), now_secs()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn insert_job(&self, video: &str, subtitle: &str, reference: &str, dry_run: bool) -> Result<i64> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO jobs (video, subtitle, reference, dry_run, status, created_at) VALUES (?1,?2,?3,?4,'queued',?5)",
+            params![video, subtitle, reference, dry_run, now_secs()],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn mark_job_running(&self, id: i64) -> Result<()> {
+        self.conn().execute("UPDATE jobs SET status='running', started_at=?2 WHERE id=?1", params![id, now_secs()])?;
+        Ok(())
+    }
+
+    pub fn finish_job(&self, id: i64, status: &str, result: &serde_json::Value) -> Result<()> {
+        self.conn().execute(
+            "UPDATE jobs SET status=?2, finished_at=?3, result=?4 WHERE id=?1",
+            params![id, status, now_secs(), result.to_string()],
+        )?;
+        Ok(())
+    }
+
+    fn row_to_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<JobRow> {
+        let result: Option<String> = r.get(9)?;
+        Ok(JobRow {
+            id: r.get(0)?,
+            video: r.get(1)?,
+            subtitle: r.get(2)?,
+            reference: r.get(3)?,
+            dry_run: r.get(4)?,
+            status: r.get(5)?,
+            created_at: r.get(6)?,
+            started_at: r.get(7)?,
+            finished_at: r.get(8)?,
+            result: result.and_then(|s| serde_json::from_str(&s).ok()),
+        })
+    }
+
+    pub fn get_job(&self, id: i64) -> Result<Option<JobRow>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT id,video,subtitle,reference,dry_run,status,created_at,started_at,finished_at,result FROM jobs WHERE id=?1",
+                params![id],
+                Self::row_to_job,
+            )
+            .optional()?)
+    }
+
+    pub fn list_jobs(&self, limit: usize, status: Option<&str>) -> Result<Vec<JobRow>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id,video,subtitle,reference,dry_run,status,created_at,started_at,finished_at,result FROM jobs
+             WHERE (?1 IS NULL OR status=?1) ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![status, limit as i64], Self::row_to_job)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Jobs left queued or running by a previous process.
+    pub fn unfinished_jobs(&self) -> Result<Vec<JobRow>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id,video,subtitle,reference,dry_run,status,created_at,started_at,finished_at,result FROM jobs
+             WHERE status IN ('queued','running') ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], Self::row_to_job)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn get_scan_state(&self, subtitle: &str) -> Result<Option<ScanState>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT sub_size, sub_mtime_ns, video_size, video_mtime_ns, outcome FROM scan_state WHERE subtitle=?1",
+                params![subtitle],
+                |r| {
+                    Ok(ScanState {
+                        sub_size: r.get(0)?,
+                        sub_mtime_ns: r.get(1)?,
+                        video_size: r.get(2)?,
+                        video_mtime_ns: r.get(3)?,
+                        outcome: r.get(4)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn put_scan_state(&self, sub: &FileKey, video: &FileKey, outcome: &str) -> Result<()> {
+        self.conn().execute(
+            "INSERT OR REPLACE INTO scan_state (subtitle, sub_size, sub_mtime_ns, video, video_size, video_mtime_ns, outcome, processed_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![sub.path, sub.size, sub.mtime_ns, video.path, video.size, video.mtime_ns, outcome, now_secs()],
+        )?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use subsyncer_core::Interval;
+
+    #[test]
+    fn timeline_and_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let key = FileKey { path: "/m/a.mkv".into(), size: 10, mtime_ns: 5 };
+        let tl = Timeline::from_intervals([Interval::new(100, 900)], Some(200));
+        assert!(cache.get_timeline(&key, 1, "v1").unwrap().is_none());
+        cache.put_timeline(&key, 1, "v1", &tl).unwrap();
+        assert_eq!(cache.get_timeline(&key, 1, "v1").unwrap(), Some(tl.clone()));
+        assert!(cache.get_timeline(&key, 1, "v2").unwrap().is_none());
+        let newer = FileKey { mtime_ns: 6, ..key.clone() };
+        cache.put_timeline(&newer, 1, "v1", &tl).unwrap();
+        assert!(cache.get_timeline(&key, 1, "v1").unwrap().is_none(), "stale entry replaced");
+
+        let id = cache.insert_job("/v.mkv", "/v.srt", "auto", false).unwrap();
+        assert_eq!(cache.unfinished_jobs().unwrap().len(), 1);
+        cache.mark_job_running(id).unwrap();
+        cache.finish_job(id, "synced", &serde_json::json!({"offset_ms": 5})).unwrap();
+        let j = cache.get_job(id).unwrap().unwrap();
+        assert_eq!(j.status, "synced");
+        assert_eq!(j.result.unwrap()["offset_ms"], 5);
+        assert!(cache.unfinished_jobs().unwrap().is_empty());
+        assert_eq!(cache.list_jobs(10, None).unwrap().len(), 1);
+        assert_eq!(cache.list_jobs(10, Some("failed")).unwrap().len(), 0);
+    }
+}
