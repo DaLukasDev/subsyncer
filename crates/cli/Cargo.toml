@@ -1,0 +1,24 @@
+[package]
+name = "subsyncer"
+description = "Sync subtitle files to video; drop-in replacement for Bazarr's built-in sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+subsyncer-core.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio.workspace = true
+axum.workspace = true
+ort.workspace = true
+rusqlite.workspace = true
+tempfile.workspace = true
+walkdir.workspace = true
+serde_urlencoded.workspace = true
