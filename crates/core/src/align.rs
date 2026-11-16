@@ -764,3 +764,6 @@ pub fn overlap_score(reference: &Timeline, cues: &[Interval]) -> f64 {
     }
     if total == 0 { 0.0 } else { hit as f64 / total as f64 }
 }
+
+#[cfg(test)]
+mod tests;

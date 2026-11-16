@@ -6,10 +6,12 @@
 pub mod align;
 pub mod classify;
 pub mod encoding;
+pub mod gate;
 pub mod subtitle;
 pub mod timeline;
 
 pub use align::{AlignConfig, Alignment, Mapping};
+pub use gate::{GateConfig, Outcome, Verdict};
 pub use subtitle::{Format, SubtitleFile, TsKind};
 pub use timeline::{Interval, Timeline};
 
