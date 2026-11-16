@@ -1,5 +1,7 @@
-# Example: subsyncer next to Bazarr. Mount media at the SAME paths Bazarr
-# uses (simplest), or set SUBSYNCER_PATH_MAP to translate them.
+# Example: subsyncer next to Bazarr.
+#
+# The one rule: subsyncer must see your media at the SAME paths as Bazarr
+# (simplest), or translate them with SUBSYNCER_PATH_MAP.
 services:
   bazarr:
     image: lscr.io/linuxserver/bazarr:latest
@@ -16,21 +18,24 @@ services:
     restart: unless-stopped
 
   subsyncer:
-    image: ghcr.io/dalukasdev/subsyncer:latest
+    # Prebuilt images will be published at ghcr.io/dalukasdev/subsyncer.
+    # Until then, Compose builds the image from the repository (a few
+    # minutes the first time).
+    build: https://github.com/DaLukasDev/subsyncer.git#main
+    image: subsyncer:local
     environment:
-      - PUID=1000          # same user that owns your subtitle files
+      - PUID=1000          # the user that owns your subtitle files
       - PGID=1000
-      - SUBSYNCER_WORKERS=1             # audio decoding + VAD is CPU-heavy
       # - SUBSYNCER_API_KEY=change-me   # then add -H "X-Api-Key: change-me" to the Bazarr command
       # - SUBSYNCER_PATH_MAP=/tv=/media/tv,/movies=/media/movies
-      # - SUBSYNCER_BACKUP=false        # don't keep <subtitle>.bak
-      # - SUBSYNCER_MAX_OFFSET_SECS=60
+      # - SUBSYNCER_BACKUP=false        # don't keep <subtitle>.bak files
       # - SUBSYNCER_LOG_LEVEL=debug
     volumes:
       - ./subsyncer/data:/data          # cache + job history (SQLite)
       - /srv/media/movies:/movies       # same paths as in Bazarr
       - /srv/media/tv:/tv
-    # Only Bazarr needs to reach it; no port needs to be published.
+    # Bazarr reaches subsyncer over the Compose network; publishing the port
+    # is only needed to look at http://localhost:8080/jobs from the host.
     # ports:
     #   - "8080:8080"
     restart: unless-stopped
