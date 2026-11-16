@@ -16,7 +16,7 @@ services:
     restart: unless-stopped
 
   subsyncer:
-    image: ghcr.io/OWNER/subsyncer:latest
+    image: ghcr.io/dalukasdev/subsyncer:latest
     environment:
       - PUID=1000          # same user that owns your subtitle files
       - PGID=1000

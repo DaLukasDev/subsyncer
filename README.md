@@ -225,7 +225,7 @@ already synced.
 
 ```sh
 docker run -d --name subsyncer -e PUID=1000 -e PGID=1000 \
-  -v ./data:/data -v /srv/media/tv:/tv ghcr.io/OWNER/subsyncer:latest
+  -v ./data:/data -v /srv/media/tv:/tv ghcr.io/dalukasdev/subsyncer:latest
 ```
 
 The image runs subsyncer as `PUID:PGID` (it uses `tini` and `gosu`, or runs
