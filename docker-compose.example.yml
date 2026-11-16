@@ -1,0 +1,36 @@
+# Example: subsyncer next to Bazarr. Mount media at the SAME paths Bazarr
+# uses (simplest), or set SUBSYNCER_PATH_MAP to translate them.
+services:
+  bazarr:
+    image: lscr.io/linuxserver/bazarr:latest
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+    volumes:
+      - ./bazarr/config:/config
+      - /srv/media/movies:/movies
+      - /srv/media/tv:/tv
+    ports:
+      - "6767:6767"
+    restart: unless-stopped
+
+  subsyncer:
+    image: ghcr.io/OWNER/subsyncer:latest
+    environment:
+      - PUID=1000          # same user that owns your subtitle files
+      - PGID=1000
+      - SUBSYNCER_WORKERS=1             # audio decoding + VAD is CPU-heavy
+      # - SUBSYNCER_API_KEY=change-me   # then add -H "X-Api-Key: change-me" to the Bazarr command
+      # - SUBSYNCER_PATH_MAP=/tv=/media/tv,/movies=/media/movies
+      # - SUBSYNCER_BACKUP=false        # don't keep <subtitle>.bak
+      # - SUBSYNCER_MAX_OFFSET_SECS=60
+      # - SUBSYNCER_LOG_LEVEL=debug
+    volumes:
+      - ./subsyncer/data:/data          # cache + job history (SQLite)
+      - /srv/media/movies:/movies       # same paths as in Bazarr
+      - /srv/media/tv:/tv
+    # Only Bazarr needs to reach it; no port needs to be published.
+    # ports:
+    #   - "8080:8080"
+    restart: unless-stopped
