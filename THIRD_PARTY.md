@@ -32,8 +32,10 @@ SOFTWARE.```
 
 ## ONNX Runtime
 
-Prebuilt by the `ort` crate and statically linked into the `subsyncer` binary
-(release binaries and Docker image).
+Version 1.31.0, prebuilt by the `ort` crate and statically linked into the
+`subsyncer` binary (release binaries and Docker image). ONNX Runtime bundles
+further third-party code; Microsoft's notices for it are in
+[`licenses/onnxruntime-ThirdPartyNotices.txt`](licenses/onnxruntime-ThirdPartyNotices.txt).
 
 https://github.com/microsoft/onnxruntime
 
@@ -63,8 +65,12 @@ SOFTWARE.
 
 ## Rust crates
 
-All Rust dependencies are permissively licensed (MIT, Apache-2.0, BSD, ISC,
-Zlib, Unicode). Generate a full list with `cargo about` or `cargo license`.
+All Rust dependencies compiled into `subsyncer` are under permissive licences
+(MIT, Apache-2.0, BSD-3-Clause, ISC, Zlib, Unicode-3.0, Unlicense, BSL-1.0);
+none are copyleft. `r-efi` also offers LGPL-2.1 but is MIT-licensed as used
+here, and `webpki-roots` (CDLA-Permissive-2.0) runs only in the build script
+that downloads ONNX Runtime. List them with
+`cargo metadata --format-version 1 | jq -r '.packages[] | "\(.name) \(.license)"'`.
 
 ## FFmpeg
 
@@ -74,3 +80,9 @@ release (version and SHA-256 pinned in the `Dockerfile`) by
 `docker/build-ffmpeg.sh`. That configuration enables no GPL or non-free
 components, so those binaries are LGPL-2.1-or-later. Their source is the pinned
 release tarball from https://ffmpeg.org/releases/ plus that build script.
+
+## Where these notices ship
+
+Release archives include this file and the `licenses/` directory. In the Docker
+image they are in `/usr/share/doc/subsyncer/`, together with FFmpeg's
+`COPYING.LGPLv2.1` and `LICENSE.md`.
