@@ -2,3 +2,4 @@
 //! HTTP API and library scanning around `subsyncer-core`.
 
 pub mod media;
+pub mod vad;
