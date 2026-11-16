@@ -3,5 +3,6 @@
 
 pub mod cache;
 pub mod engine;
+pub mod logging;
 pub mod media;
 pub mod vad;
