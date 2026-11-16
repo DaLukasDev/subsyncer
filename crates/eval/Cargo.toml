@@ -1,0 +1,18 @@
+[package]
+name = "subsyncer-eval"
+description = "Evaluation harness for subsyncer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+subsyncer-core.workspace = true
+subsyncer.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tracing.workspace = true

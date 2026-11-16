@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/cli"]
+members = ["crates/core", "crates/cli", "crates/eval"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,6 +10,7 @@ rust-version = "1.88"
 
 [workspace.dependencies]
 subsyncer-core = { path = "crates/core" }
+subsyncer = { path = "crates/cli" }
 anyhow = "1.0.104"
 thiserror = "2.0.21"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -30,6 +31,8 @@ serde_urlencoded = "0.7.1"
 
 # The alignment code is numeric; keep tests fast in debug builds.
 [profile.dev.package.subsyncer-core]
+opt-level = 3
+[profile.dev.package.subsyncer-eval]
 opt-level = 3
 [profile.dev.package.rustfft]
 opt-level = 3
