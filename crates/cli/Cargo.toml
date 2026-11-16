@@ -6,6 +6,10 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[[bin]]
+name = "subsyncer"
+path = "src/main.rs"
+
 [dependencies]
 subsyncer-core.workspace = true
 anyhow.workspace = true
