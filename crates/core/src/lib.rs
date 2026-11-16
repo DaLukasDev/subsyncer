@@ -4,6 +4,7 @@
 //! arrays on a 10 ms grid (see [`timeline`]).
 
 pub mod encoding;
+pub mod subtitle;
 pub mod timeline;
 
 pub use timeline::{Interval, Timeline};
