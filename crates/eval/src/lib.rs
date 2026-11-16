@@ -1,6 +1,7 @@
 //! Evaluation harness for subsyncer: synthetic scenarios (no media, run in
 //! CI) and a real-corpus mode.
 
+pub mod corpus;
 pub mod perturb;
 pub mod report;
 pub mod synth;
