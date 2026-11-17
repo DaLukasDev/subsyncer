@@ -1,15 +1,17 @@
 # Multi-arch image on GHCR, each architecture built natively (no QEMU).
 # main -> :edge, tags vX.Y.Z -> :X.Y.Z, :X.Y, :latest
-#
-# Automatic builds are switched off for now; run it by hand from the Actions
-# tab. To re-enable, restore the push trigger:
-#   push:
-#     branches: [main]
-#     tags: ["v*.*.*"]
 name: Docker
 
 on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
   workflow_dispatch:
+
+# A newer push to the same ref supersedes an image build in progress.
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
