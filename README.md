@@ -39,9 +39,9 @@ original is kept as `<subtitle>.bak`.
 
 You need Docker with Compose, and Bazarr running in Docker on the same machine.
 
-> **Note:** prebuilt images aren't published yet. Until they are, Compose
-> builds the image from this repository, which takes a few minutes the first
-> time.
+The image is `ghcr.io/dalukasdev/subsyncer` (amd64 and arm64). Until the first
+release it is published as `:edge`, which follows the `main` branch; releases
+will add `:latest` and version tags.
 
 ### 1. Add subsyncer next to Bazarr
 
@@ -50,8 +50,7 @@ Add this service to the `docker-compose.yml` that runs Bazarr (full example:
 
 ```yaml
   subsyncer:
-    build: https://github.com/DaLukasDev/subsyncer.git#main
-    image: subsyncer:local
+    image: ghcr.io/dalukasdev/subsyncer:edge
     environment:
       - PUID=1000      # the user that owns your media files (same as Bazarr's)
       - PGID=1000
@@ -125,16 +124,13 @@ command:
 
 ```sh
 # Fix one subtitle (add --dry-run to only see what it would do)
-docker run --rm -e PUID=$(id -u) -e PGID=$(id -g) -v /srv/media:/media subsyncer:local \
+docker run --rm -e PUID=$(id -u) -e PGID=$(id -g) -v /srv/media:/media ghcr.io/dalukasdev/subsyncer:edge \
   sync "/media/movies/Movie (2010)/Movie (2010).mkv" "/media/movies/Movie (2010)/Movie (2010).en.srt"
 
 # Check a whole library; pairs each subtitle with the video it belongs to
-docker run --rm -e PUID=$(id -u) -e PGID=$(id -g) -v /srv/media:/media -v ./subsyncer/data:/data subsyncer:local \
+docker run --rm -e PUID=$(id -u) -e PGID=$(id -g) -v /srv/media:/media -v ./subsyncer/data:/data ghcr.io/dalukasdev/subsyncer:edge \
   scan /media --dry-run
 ```
-
-To build the image without Compose, run
-`docker build -t subsyncer:local https://github.com/DaLukasDev/subsyncer.git#main`.
 
 Example output:
 

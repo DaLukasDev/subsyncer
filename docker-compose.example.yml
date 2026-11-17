@@ -18,11 +18,8 @@ services:
     restart: unless-stopped
 
   subsyncer:
-    # Prebuilt images will be published at ghcr.io/dalukasdev/subsyncer.
-    # Until then, Compose builds the image from the repository (a few
-    # minutes the first time).
-    build: https://github.com/DaLukasDev/subsyncer.git#main
-    image: subsyncer:local
+    # :edge follows the main branch; releases will add :latest and version tags.
+    image: ghcr.io/dalukasdev/subsyncer:edge
     environment:
       - PUID=1000          # the user that owns your subtitle files
       - PGID=1000
