@@ -18,8 +18,9 @@ services:
     restart: unless-stopped
 
   subsyncer:
-    # :edge follows the main branch; releases will add :latest and version tags.
-    image: ghcr.io/dalukasdev/subsyncer:edge
+    # :latest is the newest release; pin a version (e.g. :0.1.0) or use :edge
+    # for the main branch.
+    image: ghcr.io/dalukasdev/subsyncer:latest
     environment:
       - PUID=1000          # the user that owns your subtitle files
       - PGID=1000

@@ -39,9 +39,9 @@ original is kept as `<subtitle>.bak`.
 
 You need Docker with Compose, and Bazarr running in Docker on the same machine.
 
-The image is `ghcr.io/dalukasdev/subsyncer` (amd64 and arm64). Until the first
-release it is published as `:edge`, which follows the `main` branch; releases
-will add `:latest` and version tags.
+The image is `ghcr.io/dalukasdev/subsyncer` (amd64 and arm64): `:latest` is
+the newest release, a version tag like `:0.1.0` pins one, and `:edge` follows
+the `main` branch.
 
 ### 1. Add subsyncer next to Bazarr
 
@@ -50,7 +50,7 @@ Add this service to the `docker-compose.yml` that runs Bazarr (full example:
 
 ```yaml
   subsyncer:
-    image: ghcr.io/dalukasdev/subsyncer:edge
+    image: ghcr.io/dalukasdev/subsyncer:latest
     environment:
       - PUID=1000      # the user that owns your media files (same as Bazarr's)
       - PGID=1000
@@ -124,11 +124,11 @@ command:
 
 ```sh
 # Fix one subtitle (add --dry-run to only see what it would do)
-docker run --rm -e PUID=$(id -u) -e PGID=$(id -g) -v /srv/media:/media ghcr.io/dalukasdev/subsyncer:edge \
+docker run --rm -e PUID=$(id -u) -e PGID=$(id -g) -v /srv/media:/media ghcr.io/dalukasdev/subsyncer:latest \
   sync "/media/movies/Movie (2010)/Movie (2010).mkv" "/media/movies/Movie (2010)/Movie (2010).en.srt"
 
 # Check a whole library; pairs each subtitle with the video it belongs to
-docker run --rm -e PUID=$(id -u) -e PGID=$(id -g) -v /srv/media:/media -v ./subsyncer/data:/data ghcr.io/dalukasdev/subsyncer:edge \
+docker run --rm -e PUID=$(id -u) -e PGID=$(id -g) -v /srv/media:/media -v ./subsyncer/data:/data ghcr.io/dalukasdev/subsyncer:latest \
   scan /media --dry-run
 ```
 
@@ -253,6 +253,18 @@ Details: [docs/how-it-works.md](docs/how-it-works.md). Accuracy measurements:
 [docs/evaluation.md](docs/evaluation.md). On synthetic tests, 99.6% of lines
 end up within 200 ms of the right time, and subtitles that belong to a
 different video are never changed. HTTP API: [docs/http-api.md](docs/http-api.md).
+
+## Without Docker
+
+Each [release](https://github.com/DaLukasDev/subsyncer/releases) has
+`subsyncer` binaries for Linux on x86_64 and arm64. Unpack one and put it on
+your `PATH`. You also need `ffmpeg` and `ffprobe` installed, and glibc 2.38 or
+newer (Ubuntu 24.04+, Debian 13+, Fedora 39+).
+
+```sh
+tar xzf subsyncer-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+./subsyncer-v0.1.0-x86_64-unknown-linux-gnu/subsyncer sync movie.mkv movie.en.srt
+```
 
 ## Building from source
 
