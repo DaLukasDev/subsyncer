@@ -92,24 +92,60 @@ fn ort_err<E: std::fmt::Display>(e: E) -> anyhow::Error {
     anyhow::anyhow!("onnxruntime: {e}")
 }
 
+/// Loaded models ready for reuse. Loading one (~20 ms) is a noticeable part
+/// of analysing a short audio sample, and a sync can analyse several.
+static POOL: std::sync::Mutex<Vec<Vad>> = std::sync::Mutex::new(Vec::new());
+/// Models kept in the pool at most (one per concurrent detector is enough).
+const POOL_MAX: usize = 16;
+
+impl Vad {
+    /// A model from the pool, reset, or a newly loaded one.
+    fn take() -> Result<Self> {
+        let pooled = POOL.lock().unwrap_or_else(|e| e.into_inner()).pop();
+        match pooled {
+            Some(mut v) => {
+                v.reset();
+                Ok(v)
+            }
+            None => Self::new(),
+        }
+    }
+
+    fn give_back(self) {
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        if pool.len() < POOL_MAX {
+            pool.push(self);
+        }
+    }
+}
+
 /// Streaming speech detector: feed s16 samples, get a timeline at the end.
 pub struct SpeechDetector {
-    vad: Vad,
+    /// Always `Some` until dropped, when it goes back to the pool.
+    vad: Option<Vad>,
     pending: Vec<f32>,
     probs: Vec<f32>,
 }
 
+impl Drop for SpeechDetector {
+    fn drop(&mut self) {
+        if let Some(v) = self.vad.take() {
+            v.give_back();
+        }
+    }
+}
+
 impl SpeechDetector {
     pub fn new() -> Result<Self> {
-        Ok(Self { vad: Vad::new()?, pending: Vec::with_capacity(WINDOW * 2), probs: Vec::new() })
+        Ok(Self { vad: Some(Vad::take()?), pending: Vec::with_capacity(WINDOW * 2), probs: Vec::new() })
     }
 
     pub fn push_s16(&mut self, samples: &[i16]) -> Result<()> {
         for &s in samples {
             self.pending.push(s as f32 / 32768.0);
             if self.pending.len() == WINDOW {
-                let p = self.vad.process(&self.pending)?;
-                self.probs.push(p);
+                let vad = self.vad.as_mut().expect("model present until drop");
+                self.probs.push(vad.process(&self.pending)?);
                 self.pending.clear();
             }
         }
@@ -126,11 +162,12 @@ impl SpeechDetector {
         if !self.pending.is_empty() {
             let mut w = std::mem::take(&mut self.pending);
             w.resize(WINDOW, 0.0);
-            let p = self.vad.process(&w)?;
-            self.probs.push(p);
+            let vad = self.vad.as_mut().expect("model present until drop");
+            self.probs.push(vad.process(&w)?);
         }
         let n_frames = (total_samples as i64 * 1000 / SAMPLE_RATE as i64 / FRAME_MS) as usize;
-        Ok((probs_to_timeline(&self.probs, n_frames), self.probs))
+        let probs = std::mem::take(&mut self.probs);
+        Ok((probs_to_timeline(&probs, n_frames), probs))
     }
 }
 
@@ -194,6 +231,29 @@ mod tests {
         assert_eq!(tl.len(), 200);
         assert!(probs.iter().all(|&p| p < 0.2), "{probs:?}");
         assert_eq!(tl.active_fraction(), 0.0);
+    }
+
+    #[test]
+    fn pooled_models_start_from_a_clean_state() {
+        // A tone-free burst of noise, then silence: a reused model must give
+        // the silence the same probabilities a fresh one does.
+        let mut x = 1u32;
+        let noise: Vec<i16> = (0..SAMPLE_RATE)
+            .map(|_| {
+                x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                (x >> 16) as i16
+            })
+            .collect();
+        let silence = vec![0i16; SAMPLE_RATE];
+        let probs = |first: &[i16]| {
+            let mut det = SpeechDetector::new().unwrap();
+            det.push_s16(first).unwrap();
+            det.finish().unwrap().1
+        };
+        let fresh = probs(&silence);
+        let _ = probs(&noise); // leaves a model with state in the pool
+        let reused = probs(&silence);
+        assert_eq!(fresh, reused);
     }
 
     #[test]
