@@ -31,7 +31,7 @@ original is kept as `<subtitle>.bak`.
 |---|---|
 | Voice detection gets confused by music and effects | Neural voice detection (Silero VAD), listening to the centre channel where dialogue lives |
 | One shift for the whole file | Also fixes files where only part is off (ad breaks, different cuts) |
-| Ignores subtitle tracks already inside the video | Uses them as a precise reference when available |
+| Ignores subtitle tracks already inside the video | Uses them as a precise reference when available, after checking them against the audio |
 | Can make a correct subtitle worse | Writes only when it's confident and the result is measurably better |
 | Decodes the audio again for every subtitle | Remembers each video, so the second language is instant |
 
@@ -188,6 +188,7 @@ Tuning (the defaults come from the [evaluation](docs/evaluation.md)):
 | `SUBSYNCER_NO_SPLITS` | `false` | Only ever apply one shift (plus frame-rate correction) |
 | `SUBSYNCER_MIN_CONFIDENCE` | `6.0` | How sure it must be before writing |
 | `SUBSYNCER_MIN_IMPROVEMENT` | `0.01` | How much better the result must be before writing |
+| `SUBSYNCER_EMBEDDED_CHECK` | `sampled` | How a subtitle track inside the video is checked against the audio before it's used as the reference: `sampled` (a few short audio samples, the full audio only when they don't settle it), `full` (always the full audio) or `off` (trust it) |
 | `SUBSYNCER_FFMPEG`, `SUBSYNCER_FFPROBE` | `ffmpeg`, `ffprobe` | FFmpeg binaries, outside Docker |
 
 ## Troubleshooting
@@ -223,8 +224,8 @@ are off. Then look at Bazarr's log for a `Post-processing result` line.
 
 Usually the subtitle belongs to a different release of the video, or the audio
 has very little dialogue. Run it by hand with `--dry-run --log-level debug` to
-see the details. If the video contains its own subtitle track, try
-`--reference embedded`.
+see the details. If the video contains its own subtitle track and you know it's
+in sync, try `--reference embedded`.
 
 #### Files are owned by the wrong user
 
@@ -241,9 +242,11 @@ restarts.
 ## How it works
 
 In short:
-1. subsyncer builds a "who is speaking when" timeline for the video, from a
-   subtitle track inside the video or by listening to the audio with a neural
-   voice detector.
+1. subsyncer builds a "who is speaking when" timeline for the video, by
+   listening to the audio with a neural voice detector, or from a subtitle
+   track inside the video. Such a track is only used once a few samples of
+   the audio confirm it's in sync, since a track muxed in from another release
+   can be off.
 2. It compares that with the subtitle's timing, trying different frame rates.
 3. If only parts of the file are off, it finds where they start and shifts each
    part separately.

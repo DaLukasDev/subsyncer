@@ -52,12 +52,19 @@ Responses:
   "prominence": 10.1,
   "video": "...", "subtitle": "...", "reference": "auto", "dry_run": false,
   "created_at": 1763337600, "started_at": 1763337600, "finished_at": 1763337602,
-  "result": { "...": "full report, including per-segment offsets" }
+  "result": { "...": "full report: per-segment offsets, embedded_check, ..." }
 }
 ```
 
 `status` is `queued`, `running` or `done`. `outcome` is one of `synced`,
 `already_synced`, `low_confidence` or `failed`.
+
+When the video has a usable embedded subtitle track, `result.embedded_check`
+says how it was checked against the audio:
+- `method`: `samples`, `samples+full`, `full` or `unchecked`;
+- whether it was `used`;
+- a one-line `summary`;
+- the individual sample, full and region checks.
 
 ## `GET /jobs?limit=50&status=done`
 

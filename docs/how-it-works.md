@@ -9,10 +9,11 @@ finding the shift (or set of shifts) that makes them line up.
 1. **Probe** the video's streams with `ffprobe`.
 2. **Build a reference timeline** for the video.
    - *Embedded subtitles*: if the video contains a text subtitle track (subrip,
-     ass, mov_text, webvtt), its timing is the reference. The track with the
-     most dialogue cues wins. Forced/signs tracks are skipped: those with the
-     forced flag, "forced"/"signs" in the title, or fewer than 50% of the target
-     subtitle's cues.
+     ass, mov_text, webvtt), its timing can be the reference. The track with
+     the most dialogue cues wins. Forced/signs tracks are skipped: those with
+     the forced flag, "forced"/"signs" in the title, or fewer than 50% of the
+     target subtitle's cues. The track is used only once it has passed a check
+     against the audio ([below](#checking-embedded-tracks)).
    - *Audio*: otherwise ffmpeg decodes the default audio stream to 16 kHz mono.
      If the layout has a centre channel, that channel is used alone
      (`pan=mono|c0=FC`), because that is where dialogue lives in a surround mix.
@@ -57,6 +58,54 @@ finding the shift (or set of shifts) that makes them line up.
    version is kept as `<subtitle>.bak`.
 
 Formats: SRT, WebVTT (including inline karaoke timestamps) and ASS/SSA.
+
+## Checking embedded tracks
+
+An embedded track is a better reference than detected speech when it is
+right: its timing is exact. But a track muxed in from another release or cut
+can be off, and trusting it would move a correct subtitle to match it, with
+high confidence, because two subtitle tracks line up almost perfectly. So with
+`--reference auto` (what Bazarr uses) the track is checked first. The code is
+in `crates/core/src/verify.rs`.
+
+1. **Samples.** Speech is detected in three 2.5-minute stretches of the audio.
+   ffmpeg seeks to them, so only those are decoded. Two go where the track has
+   the most dialogue, one at the end of its dialogue. The track's cues in each
+   2-minute window are correlated with the speech over ±15 s.
+   - If every window lines up clearly (detrended z-score ≥ 4) within ±400 ms
+     of the expected position, and their average within ±250 ms, the track is
+     used.
+   - If one lines up clearly somewhere else, it isn't.
+   - The expected position is +100 ms: detected speech starts about that long
+     after a cue.
+2. **Full audio**, used when the samples don't settle it. It is also used when
+   the video is shorter than 20 minutes (decoding it all is cheap then) and
+   when its speech timeline is already cached. The track is aligned against
+   the full audio like any subtitle. It must need no frame-rate change and no
+   shift beyond 250 ms, and must line up confidently. Each 2-minute stretch is
+   also checked on its own over ±60 s:
+   - none may line up clearly elsewhere;
+   - no two stretches in a row may fail to support it;
+   - the stretches that don't support it may hold at most 20% of its cues;
+   - the last stretch must support it.
+3. **Regions of a split result.** Samples can miss a stretch that is off,
+   typically near the end. That matters only when it changes the result: the
+   subtitle then gets split to follow the track there. So when the result
+   against an accepted track has several segments, the track is checked
+   against the audio in each segment's region. If the track (rather than the
+   subtitle) has the cut, its cues there line up at a known other offset: the
+   difference between the segments' shifts. The in-sync offset must beat that
+   offset on both the plain and the detrended correlation.
+
+A rejected track means the sync uses the audio instead. If the audio can't be
+analysed at all, the track is used unchecked, as before 0.1.1. Other modes:
+- `--reference embedded` always trusts the track;
+- `SUBSYNCER_EMBEDDED_CHECK=full` skips the samples;
+- `SUBSYNCER_EMBEDDED_CHECK=off` turns the check off.
+
+Three samples take about 1–1.5 s. The full audio of a 45-minute episode takes
+5–10 s. The job report records each check under `embedded_check`.
+[evaluation.md](evaluation.md#embedded-track-check) has the measurements.
 
 ## The Bazarr command
 
@@ -114,7 +163,8 @@ Runtime. `ffmpeg` and `ffprobe` must be on `PATH` (or set `SUBSYNCER_FFMPEG` /
 
 ## Code layout
 
-- `crates/core`: parsers, alignment, scoring. Pure: no IO, no ffmpeg.
+- `crates/core`: parsers, alignment, scoring, the embedded-track check. Pure:
+  no IO, no ffmpeg.
 - `crates/cli`: the `subsyncer` binary, covering ffmpeg/ffprobe, VAD, HTTP,
   cache and config.
 - `crates/eval`: the evaluation harness (see [evaluation.md](evaluation.md)).
