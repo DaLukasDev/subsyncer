@@ -152,22 +152,24 @@ pub fn dialogue_filter(stream: &Stream) -> Option<String> {
 }
 
 /// Decode a stream to 16 kHz mono s16le and feed samples to `sink`.
-/// Returns the number of samples decoded.
+/// `range` is `(start_ms, len_ms)` to decode only part of it; sample 0 is
+/// then at `start_ms`. Returns the number of samples decoded.
 pub fn decode_audio(
     tools: &Tools,
     media: &Path,
     stream_index: usize,
     filter: Option<&str>,
+    range: Option<(i64, i64)>,
     mut sink: impl FnMut(&[i16]) -> Result<()>,
 ) -> Result<u64> {
     let mut cmd = Command::new(&tools.ffmpeg);
-    cmd.args(["-nostdin", "-hide_banner", "-v", "error", "-i"]).arg(media).args([
-        "-map",
-        &format!("0:{stream_index}"),
-        "-vn",
-        "-sn",
-        "-dn",
-    ]);
+    cmd.args(["-nostdin", "-hide_banner", "-v", "error"]);
+    if let Some((start, len)) = range {
+        // Input seeking: fast, and exact when decoding (ffmpeg decodes from
+        // the preceding keyframe and drops what comes before `start`).
+        cmd.args(["-ss", &secs(start.max(0)), "-t", &secs(len.max(0))]);
+    }
+    cmd.arg("-i").arg(media).args(["-map", &format!("0:{stream_index}"), "-vn", "-sn", "-dn"]);
     if let Some(f) = filter {
         cmd.args(["-af", f]);
     }
@@ -218,6 +220,10 @@ pub fn decode_audio(
         bail!("ffmpeg audio decode failed: {}", stderr.trim());
     }
     Ok(total)
+}
+
+fn secs(ms: i64) -> String {
+    format!("{}.{:03}", ms / 1000, ms % 1000)
 }
 
 /// Extract a text subtitle stream. ASS/SSA are copied as-is (keeps style

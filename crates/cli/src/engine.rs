@@ -325,7 +325,7 @@ impl Engine {
 
     fn detect_speech(&self, video: &Path, stream: usize, filter: Option<&str>) -> Result<Timeline> {
         let mut det = SpeechDetector::new()?;
-        media::decode_audio(&self.settings.tools, video, stream, filter, |s| det.push_s16(s))?;
+        media::decode_audio(&self.settings.tools, video, stream, filter, None, |s| det.push_s16(s))?;
         if det.samples() == 0 {
             bail!("audio stream decoded to zero samples");
         }

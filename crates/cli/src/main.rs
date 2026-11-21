@@ -66,6 +66,12 @@ enum Cmd {
         /// Also print the raw per-window probabilities.
         #[arg(long)]
         probs: bool,
+        /// Analyse only from here (seconds); printed times stay absolute.
+        #[arg(long)]
+        start: Option<f64>,
+        /// Analyse only this long (seconds).
+        #[arg(long)]
+        len: Option<f64>,
     },
     /// Check the daemon's /healthz (for container healthchecks).
     Health {
@@ -151,7 +157,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             subsyncer::server::run(engine, cfg)?;
             Ok(ExitCode::SUCCESS)
         }
-        Cmd::Vad { media, stream, downmix, probs } => {
+        Cmd::Vad { media, stream, downmix, probs, start, len } => {
             let p = subsyncer::media::probe(&settings.tools, &media)?;
             let st = match stream {
                 Some(i) => p.streams.iter().find(|s| s.index == i).ok_or_else(|| anyhow::anyhow!("no stream {i}"))?,
@@ -159,16 +165,21 @@ fn run(cli: Cli) -> Result<ExitCode> {
             };
             let filter = if downmix { None } else { subsyncer::media::dialogue_filter(st) };
             let mut det = subsyncer::vad::SpeechDetector::new()?;
-            subsyncer::media::decode_audio(&settings.tools, &media, st.index, filter.as_deref(), |s| det.push_s16(s))?;
+            let start_ms = (start.unwrap_or(0.0) * 1000.0).round() as i64;
+            let range = (start.is_some() || len.is_some())
+                .then(|| (start_ms, len.map_or(i64::MAX / 4, |l| (l * 1000.0).round() as i64)));
+            subsyncer::media::decode_audio(&settings.tools, &media, st.index, filter.as_deref(), range, |s| {
+                det.push_s16(s)
+            })?;
             let (tl, pr) = det.finish()?;
             eprintln!("stream {} filter {:?}: {:.1}% speech", st.index, filter, tl.active_fraction() * 100.0);
             if probs {
                 for (i, p) in pr.iter().enumerate() {
-                    println!("{} {:.3}", i * 32, p);
+                    println!("{} {:.3}", start_ms + i as i64 * 32, p);
                 }
             } else {
                 for iv in tl.intervals() {
-                    println!("{} {}", iv.start_ms, iv.end_ms);
+                    println!("{} {}", start_ms + iv.start_ms, start_ms + iv.end_ms);
                 }
             }
             Ok(ExitCode::SUCCESS)
