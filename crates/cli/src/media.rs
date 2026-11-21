@@ -68,7 +68,7 @@ struct RawStream {
 pub fn probe(tools: &Tools, media: &Path) -> Result<Probe> {
     let out = Command::new(&tools.ffprobe)
         .args(["-v", "error", "-of", "json", "-show_streams", "-show_format"])
-        .arg(media)
+        .arg(media_arg(media)?)
         .stdin(Stdio::null())
         .output()
         .with_context(|| format!("running {}", tools.ffprobe.display()))?;
@@ -169,7 +169,7 @@ pub fn decode_audio(
         // the preceding keyframe and drops what comes before `start`).
         cmd.args(["-ss", &secs(start.max(0)), "-t", &secs(len.max(0))]);
     }
-    cmd.arg("-i").arg(media).args(["-map", &format!("0:{stream_index}"), "-vn", "-sn", "-dn"]);
+    cmd.arg("-i").arg(media_arg(media)?).args(["-map", &format!("0:{stream_index}"), "-vn", "-sn", "-dn"]);
     if let Some(f) = filter {
         cmd.args(["-af", f]);
     }
@@ -222,6 +222,12 @@ pub fn decode_audio(
     Ok(total)
 }
 
+/// `media` as an argument ffmpeg and ffprobe can't mistake for an option
+/// (`-name.mkv`) or a protocol (`Show: Pilot.mkv`): an absolute path.
+fn media_arg(media: &Path) -> Result<PathBuf> {
+    std::path::absolute(media).with_context(|| format!("resolving {}", media.display()))
+}
+
 fn secs(ms: i64) -> String {
     format!("{}.{:03}", ms / 1000, ms % 1000)
 }
@@ -235,7 +241,7 @@ pub fn extract_subtitle(tools: &Tools, media: &Path, stream: &Stream) -> Result<
     };
     let out = Command::new(&tools.ffmpeg)
         .args(["-nostdin", "-hide_banner", "-v", "error", "-i"])
-        .arg(media)
+        .arg(media_arg(media)?)
         .args(["-map", &format!("0:{}", stream.index), "-c:s", codec, "-f", fmt, "pipe:1"])
         .stdin(Stdio::null())
         .output()
@@ -275,6 +281,14 @@ mod tests {
         }
         for l in ["stereo", "mono", "2.1", "quad", "quad(side)", "3.0(back)", "6.0(front)", "6.1(front)", "downmix"] {
             assert!(!has_front_center(l), "{l}");
+        }
+    }
+
+    #[test]
+    fn media_args_are_absolute() {
+        for name in ["-dash.mkv", "Show: Pilot.mkv", "dir/a.mkv", "/abs/a.mkv"] {
+            let a = media_arg(Path::new(name)).unwrap();
+            assert!(a.is_absolute() && a.ends_with(name.trim_start_matches('/')), "{name}: {}", a.display());
         }
     }
 
