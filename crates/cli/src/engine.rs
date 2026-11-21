@@ -688,6 +688,22 @@ impl Engine {
         }
     }
 
+    /// Fingerprint of the version and everything in the settings that can
+    /// change a result (for remembering which results to retry).
+    pub fn settings_fingerprint(&self, reference: ReferenceMode) -> String {
+        let s = &self.settings;
+        crate::cache::fingerprint(&(
+            env!("CARGO_PKG_VERSION"),
+            vad::VAD_VERSION,
+            reference,
+            s.embedded_check,
+            s.min_embedded_cue_ratio,
+            &s.check,
+            &s.align,
+            &s.gate,
+        ))
+    }
+
     /// Cache version of an embedded track's check: everything that can
     /// change its verdict.
     fn check_version(&self, mode: EmbeddedCheck) -> String {

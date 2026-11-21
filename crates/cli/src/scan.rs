@@ -1,8 +1,9 @@
 //! Library scan: find video + subtitle pairs and sync those not yet done.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
 use subsyncer_core::Outcome;
@@ -23,6 +24,8 @@ pub struct ScanOptions {
     pub reference: ReferenceMode,
     pub include_forced: bool,
     pub backup: bool,
+    /// Videos processed at once.
+    pub jobs: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -95,6 +98,17 @@ pub fn find_pairs(dir: &Path, include_forced: bool) -> Vec<(PathBuf, PathBuf)> {
     pairs
 }
 
+/// What became of one pair.
+enum Item {
+    /// Processed before, and nothing changed since.
+    Skipped,
+    /// The files couldn't be read.
+    Unreadable,
+    Done(Box<SyncReport>),
+}
+
+/// Sync every pair under `dir` not processed before. Reports arrive in
+/// `on_report` as they finish (in any order with `jobs` > 1).
 pub fn scan(
     engine: &Engine,
     dir: &Path,
@@ -106,55 +120,98 @@ pub fn scan(
     }
     let pairs = find_pairs(dir, opts.include_forced);
     let mut sum = ScanSummary { pairs: pairs.len(), ..Default::default() };
+    // The subtitles of one video go to one worker, one after the other, so
+    // its audio is analysed once and then comes from the cache.
+    let mut groups: Vec<(PathBuf, Vec<PathBuf>)> = Vec::new();
+    let mut by_video: HashMap<PathBuf, usize> = HashMap::new();
     for (video, sub) in pairs {
-        let (sub_key, video_key) = match (FileKey::of(&sub), FileKey::of(&video)) {
-            (Ok(s), Ok(v)) => (s, v),
-            _ => {
-                warn!(subtitle = %sub.display(), "cannot stat pair; skipping");
-                continue;
-            }
-        };
-        if !opts.force
-            && let Some(cache) = &engine.cache
-            && let Ok(Some(st)) = cache.get_scan_state(&sub_key.path)
-            && st.sub_size == sub_key.size
-            && st.sub_mtime_ns == sub_key.mtime_ns
-            && st.video_size == video_key.size
-            && st.video_mtime_ns == video_key.mtime_ns
-        {
-            debug!(subtitle = %sub.display(), outcome = %st.outcome, "already processed");
-            sum.skipped += 1;
-            continue;
+        let k = *by_video.entry(video.clone()).or_insert_with(|| {
+            groups.push((video, Vec::new()));
+            groups.len() - 1
+        });
+        groups[k].1.push(sub);
+    }
+    let settings = engine.settings_fingerprint(opts.reference);
+    let next = AtomicUsize::new(0);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|s| {
+        for _ in 0..opts.jobs.clamp(1, groups.len().max(1)) {
+            let tx = tx.clone();
+            let (groups, next, settings) = (&groups, &next, &settings);
+            s.spawn(move || {
+                while let Some((video, subs)) = groups.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    for sub in subs {
+                        if tx.send(process(engine, video, sub, opts, settings)).is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
         }
-        let req = SyncRequest {
-            video: video.clone(),
-            subtitle: sub.clone(),
-            reference: opts.reference,
-            dry_run: opts.dry_run,
-            output: None,
-            backup: opts.backup,
-            cancel: None,
-        };
-        let report = engine.sync(&req);
-        match report.outcome {
-            Some(Outcome::Synced) => sum.synced += 1,
-            Some(Outcome::AlreadySynced) => sum.already_synced += 1,
-            Some(Outcome::LowConfidence) => sum.low_confidence += 1,
-            _ => sum.failed += 1,
-        }
-        on_report(&report);
-        // Record deterministic outcomes; failures are retried next scan.
-        if !opts.dry_run
-            && report.outcome != Some(Outcome::Failed)
-            && let Some(cache) = &engine.cache
-        {
-            let after = FileKey::of(&sub).unwrap_or(sub_key);
-            if let Err(e) = cache.put_scan_state(&after, &video_key, report.outcome_str()) {
-                warn!("recording scan state: {e:#}");
+        drop(tx);
+        for item in rx {
+            match item {
+                Item::Skipped => sum.skipped += 1,
+                Item::Unreadable => {}
+                Item::Done(report) => {
+                    match report.outcome {
+                        Some(Outcome::Synced) => sum.synced += 1,
+                        Some(Outcome::AlreadySynced) => sum.already_synced += 1,
+                        Some(Outcome::LowConfidence) => sum.low_confidence += 1,
+                        _ => sum.failed += 1,
+                    }
+                    on_report(&report);
+                }
             }
+        }
+    });
+    Ok(sum)
+}
+
+fn process(engine: &Engine, video: &Path, sub: &Path, opts: &ScanOptions, settings: &str) -> Item {
+    let (sub_key, video_key) = match (FileKey::of(sub), FileKey::of(video)) {
+        (Ok(s), Ok(v)) => (s, v),
+        _ => {
+            warn!(subtitle = %sub.display(), "cannot stat pair; skipping");
+            return Item::Unreadable;
+        }
+    };
+    // Skip pairs processed before whose files haven't changed. A
+    // low-confidence result is retried once the version or settings
+    // change: they may settle it now.
+    if !opts.force
+        && let Some(cache) = &engine.cache
+        && let Ok(Some(st)) = cache.get_scan_state(&sub_key.path)
+        && st.sub_size == sub_key.size
+        && st.sub_mtime_ns == sub_key.mtime_ns
+        && st.video_size == video_key.size
+        && st.video_mtime_ns == video_key.mtime_ns
+        && (st.settings == settings || st.outcome != Outcome::LowConfidence.as_str())
+    {
+        debug!(subtitle = %sub.display(), outcome = %st.outcome, "already processed");
+        return Item::Skipped;
+    }
+    let req = SyncRequest {
+        video: video.to_path_buf(),
+        subtitle: sub.to_path_buf(),
+        reference: opts.reference,
+        dry_run: opts.dry_run,
+        output: None,
+        backup: opts.backup,
+        cancel: None,
+    };
+    let report = engine.sync(&req);
+    // Record deterministic outcomes; failures are retried next scan.
+    if !opts.dry_run
+        && report.outcome != Some(Outcome::Failed)
+        && let Some(cache) = &engine.cache
+    {
+        let after = FileKey::of(sub).unwrap_or(sub_key);
+        if let Err(e) = cache.put_scan_state(&after, &video_key, report.outcome_str(), settings) {
+            warn!("recording scan state: {e:#}");
         }
     }
-    Ok(sum)
+    Item::Done(Box::new(report))
 }
 
 #[cfg(test)]
@@ -195,5 +252,62 @@ mod tests {
             ]
         );
         assert_eq!(find_pairs(p, true).len(), 4);
+    }
+
+    const SRT: &[u8] = b"1\n00:00:01,000 --> 00:00:02,000\nHello\n\n2\n00:00:03,000 --> 00:00:04,000\nBye\n";
+
+    /// An engine whose syncs fail at once (no ffprobe), to exercise the scan
+    /// without media.
+    fn failing_engine(cache: Option<std::sync::Arc<crate::cache::Cache>>) -> Engine {
+        let tools = crate::media::Tools { ffprobe: "/nonexistent/ffprobe".into(), ..Default::default() };
+        Engine::new(crate::engine::Settings { tools, ..Default::default() }, cache)
+    }
+
+    fn opts(jobs: usize) -> ScanOptions {
+        ScanOptions {
+            dry_run: false,
+            force: false,
+            reference: ReferenceMode::Auto,
+            include_forced: false,
+            backup: true,
+            jobs,
+        }
+    }
+
+    #[test]
+    fn parallel_scan_reports_every_pair_once() {
+        let d = tempfile::tempdir().unwrap();
+        for v in 0..5 {
+            std::fs::write(d.path().join(format!("e{v}.mkv")), b"").unwrap();
+            for lang in ["en", "nl"] {
+                std::fs::write(d.path().join(format!("e{v}.{lang}.srt")), SRT).unwrap();
+            }
+        }
+        let mut seen = Vec::new();
+        let sum = scan(&failing_engine(None), d.path(), &opts(3), |r| seen.push(r.subtitle.clone())).unwrap();
+        assert_eq!((sum.pairs, sum.failed), (10, 10));
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 10);
+    }
+
+    #[test]
+    fn low_confidence_is_retried_after_settings_change() {
+        let d = tempfile::tempdir().unwrap();
+        let (video, sub) = (d.path().join("a.mkv"), d.path().join("a.en.srt"));
+        std::fs::write(&video, b"").unwrap();
+        std::fs::write(&sub, SRT).unwrap();
+        let cache = std::sync::Arc::new(crate::cache::Cache::open(&d.path().join("data")).unwrap());
+        let engine = failing_engine(Some(cache.clone()));
+        let current = engine.settings_fingerprint(ReferenceMode::Auto);
+        let (sk, vk) = (FileKey::of(&sub).unwrap(), FileKey::of(&video).unwrap());
+        let skipped = |outcome: &str, settings: &str| {
+            cache.put_scan_state(&sk, &vk, outcome, settings).unwrap();
+            scan(&engine, d.path(), &opts(1), |_| {}).unwrap().skipped == 1
+        };
+        assert!(!skipped("low_confidence", "older"), "retried after a change");
+        assert!(skipped("low_confidence", &current));
+        assert!(skipped("already_synced", "older"));
+        assert!(skipped("synced", "older"));
     }
 }

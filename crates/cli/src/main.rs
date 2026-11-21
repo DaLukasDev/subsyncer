@@ -93,6 +93,12 @@ enum Cmd {
         /// Also sync forced-subtitle files (`*.forced.*`).
         #[arg(long)]
         include_forced: bool,
+        /// Do not keep `<subtitle>.bak`.
+        #[arg(long)]
+        no_backup: bool,
+        /// Videos to process at once (each uses about one CPU core).
+        #[arg(long, short, default_value_t = 1)]
+        jobs: usize,
         /// Print one JSON report per line.
         #[arg(long)]
         json: bool,
@@ -185,10 +191,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Health { .. } => unreachable!("handled above"),
-        Cmd::Scan { dir, dry_run, force, reference, include_forced, json } => {
+        Cmd::Scan { dir, dry_run, force, reference, include_forced, no_backup, jobs, json } => {
             let engine = Engine::new(settings, open_cache(&cli.global, false)?);
-            let opts =
-                subsyncer::scan::ScanOptions { dry_run, force, reference, include_forced, backup: cli.global.backup };
+            let backup = cli.global.backup && !no_backup;
+            let opts = subsyncer::scan::ScanOptions { dry_run, force, reference, include_forced, backup, jobs };
             let summary = subsyncer::scan::scan(&engine, &dir, &opts, |r| {
                 if json {
                     println!("{}", serde_json::to_string(r).unwrap_or_default());

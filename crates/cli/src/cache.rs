@@ -64,6 +64,9 @@ const MIGRATIONS: &[&str] = &[
         created_at INTEGER NOT NULL,
         PRIMARY KEY (path, size, mtime_ns, stream, version)
     );",
+    // 2: the settings (and version) a scanned pair was processed with, so
+    // low-confidence results are retried after they change.
+    "ALTER TABLE scan_state ADD COLUMN settings TEXT NOT NULL DEFAULT '';",
 ];
 
 fn migrate(conn: &mut Connection) -> Result<()> {
@@ -111,6 +114,8 @@ pub struct ScanState {
     pub video_size: i64,
     pub video_mtime_ns: i64,
     pub outcome: String,
+    /// Fingerprint of the version and settings that produced `outcome`.
+    pub settings: String,
 }
 
 impl Cache {
@@ -352,7 +357,8 @@ impl Cache {
         Ok(self
             .conn()
             .query_row(
-                "SELECT sub_size, sub_mtime_ns, video_size, video_mtime_ns, outcome FROM scan_state WHERE subtitle=?1",
+                "SELECT sub_size, sub_mtime_ns, video_size, video_mtime_ns, outcome, settings
+                 FROM scan_state WHERE subtitle=?1",
                 params![subtitle],
                 |r| {
                     Ok(ScanState {
@@ -361,17 +367,29 @@ impl Cache {
                         video_size: r.get(2)?,
                         video_mtime_ns: r.get(3)?,
                         outcome: r.get(4)?,
+                        settings: r.get(5)?,
                     })
                 },
             )
             .optional()?)
     }
 
-    pub fn put_scan_state(&self, sub: &FileKey, video: &FileKey, outcome: &str) -> Result<()> {
+    pub fn put_scan_state(&self, sub: &FileKey, video: &FileKey, outcome: &str, settings: &str) -> Result<()> {
         self.conn().execute(
-            "INSERT OR REPLACE INTO scan_state (subtitle, sub_size, sub_mtime_ns, video, video_size, video_mtime_ns, outcome, processed_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![sub.path, sub.size, sub.mtime_ns, video.path, video.size, video.mtime_ns, outcome, now_secs()],
+            "INSERT OR REPLACE INTO scan_state
+             (subtitle, sub_size, sub_mtime_ns, video, video_size, video_mtime_ns, outcome, processed_at, settings)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                sub.path,
+                sub.size,
+                sub.mtime_ns,
+                video.path,
+                video.size,
+                video.mtime_ns,
+                outcome,
+                now_secs(),
+                settings
+            ],
         )?;
         Ok(())
     }
