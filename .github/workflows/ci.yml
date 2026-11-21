@@ -40,3 +40,9 @@ jobs:
             cat eval.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Embedded-track check report
+        run: |
+          {
+            echo '## Embedded-track check (synthetic)'
+            cargo run --release --locked -p subsyncer-eval -- embedded --seeds 60
+          } >> "$GITHUB_STEP_SUMMARY"
