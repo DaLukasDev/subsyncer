@@ -1,7 +1,8 @@
 //! Configuration shared by all subcommands. Every option can be set with a
 //! `SUBSYNCER_*` environment variable.
 
-use std::path::{Path, PathBuf};
+use std::ffi::OsString;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -13,8 +14,8 @@ use crate::media::Tools;
 
 #[derive(Args, Clone, Debug)]
 pub struct GlobalOpts {
-    /// Directory for the SQLite cache/job database. Default: /data if
-    /// writable, else the user cache directory.
+    /// Directory for the SQLite cache/job database (the Docker image sets
+    /// /data). Default: $XDG_CACHE_HOME/subsyncer or ~/.cache/subsyncer.
     #[arg(long, env = "SUBSYNCER_DATA_DIR", global = true)]
     pub data_dir: Option<PathBuf>,
 
@@ -81,8 +82,22 @@ pub struct GlobalOpts {
 
 impl GlobalOpts {
     pub fn settings(&self) -> Result<Settings> {
+        let at_least = |name: &str, v: Option<f64>, min: f64| -> Result<()> {
+            match v {
+                Some(v) if !(v.is_finite() && v >= min) => bail!("{name} must be a number of at least {min}, not {v}"),
+                _ => Ok(()),
+            }
+        };
+        at_least("SUBSYNCER_MAX_OFFSET_SECS", Some(self.max_offset_secs), 0.0)?;
+        at_least("SUBSYNCER_WINDOW_SECS", self.window_secs, 0.0)?;
+        at_least("SUBSYNCER_SPLIT_PENALTY", self.split_penalty, 0.0)?;
+        at_least("SUBSYNCER_MIN_CONFIDENCE", self.min_confidence, 0.0)?;
+        at_least("SUBSYNCER_MIN_IMPROVEMENT", self.min_improvement, -1.0)?;
+        if self.min_improvement.is_some_and(|m| m > 1.0) {
+            bail!("SUBSYNCER_MIN_IMPROVEMENT is a share of speech overlap, at most 1");
+        }
         if !(self.ffmpeg_timeout_secs.is_finite() && self.ffmpeg_timeout_secs > 0.0) {
-            bail!("ffmpeg timeout must be a positive number of seconds");
+            bail!("SUBSYNCER_FFMPEG_TIMEOUT_SECS must be a positive number of seconds");
         }
         let mut s = Settings {
             tools: Tools {
@@ -94,9 +109,6 @@ impl GlobalOpts {
             embedded_check: self.embedded_check,
             ..Default::default()
         };
-        if !(self.max_offset_secs.is_finite() && self.max_offset_secs >= 0.0) {
-            bail!("max offset must be a non-negative number of seconds");
-        }
         s.align.max_offset_ms = (self.max_offset_secs * 1000.0).round() as i64;
         if let Some(w) = self.window_secs {
             s.align.window_ms = (w * 1000.0).round() as i64;
@@ -118,28 +130,25 @@ impl GlobalOpts {
         PathMap::parse(self.path_map.as_deref().unwrap_or(""))
     }
 
-    /// Resolve the data directory. `required` makes failure an error
-    /// (server mode); otherwise the cache is simply disabled.
+    /// The data directory: `--data-dir`/`SUBSYNCER_DATA_DIR`, else the
+    /// user's cache directory. None with `--no-cache`.
     pub fn resolve_data_dir(&self) -> Option<PathBuf> {
         if self.no_cache {
             return None;
         }
-        if let Some(d) = &self.data_dir {
-            return Some(d.clone());
+        match &self.data_dir {
+            Some(d) if !d.as_os_str().is_empty() => Some(d.clone()),
+            _ => default_data_dir(std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME")),
         }
-        let data = Path::new("/data");
-        if data.is_dir() && is_writable(data) {
-            return Some(data.to_path_buf());
-        }
-        let base = std::env::var_os("XDG_CACHE_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
-        Some(base.join("subsyncer"))
     }
 }
 
-fn is_writable(dir: &Path) -> bool {
-    tempfile::tempfile_in(dir).is_ok()
+/// `$XDG_CACHE_HOME/subsyncer`, else `~/.cache/subsyncer`. A relative or
+/// empty XDG_CACHE_HOME is ignored, as the XDG spec says.
+fn default_data_dir(xdg_cache_home: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
+    let xdg = xdg_cache_home.map(PathBuf::from).filter(|p| p.is_absolute());
+    let home = home.filter(|h| !h.is_empty()).map(|h| PathBuf::from(h).join(".cache"));
+    Some(xdg.or(home)?.join("subsyncer"))
 }
 
 /// Prefix-based path rewriting for paths sent by Bazarr.
@@ -185,6 +194,43 @@ impl PathMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn opts(args: &[&str]) -> GlobalOpts {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            global: GlobalOpts,
+        }
+        <Cli as clap::Parser>::try_parse_from(std::iter::once("subsyncer").chain(args.iter().copied())).unwrap().global
+    }
+
+    #[test]
+    fn tuning_values_are_checked() {
+        assert!(opts(&[]).settings().is_ok());
+        assert!(opts(&["--window-secs=30", "--min-improvement=-0.5"]).settings().is_ok());
+        for bad in [
+            "--window-secs=-1",
+            "--window-secs=NaN",
+            "--split-penalty=-5",
+            "--min-confidence=inf",
+            "--min-improvement=2",
+            "--max-offset-secs=-3",
+            "--ffmpeg-timeout-secs=0",
+        ] {
+            assert!(opts(&[bad]).settings().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn data_dir_defaults_to_the_user_cache() {
+        let os = |s: &str| Some(OsString::from(s));
+        assert_eq!(default_data_dir(os("/xdg"), os("/home/u")), Some(PathBuf::from("/xdg/subsyncer")));
+        assert_eq!(default_data_dir(os("rel"), os("/home/u")), Some(PathBuf::from("/home/u/.cache/subsyncer")));
+        assert_eq!(default_data_dir(None, os("/home/u")), Some(PathBuf::from("/home/u/.cache/subsyncer")));
+        assert_eq!(default_data_dir(None, None), None);
+        assert_eq!(opts(&["--data-dir", "/d"]).resolve_data_dir(), Some(PathBuf::from("/d")));
+        assert_eq!(opts(&["--data-dir", "/d", "--no-cache"]).resolve_data_dir(), None);
+    }
 
     #[test]
     fn path_map() {
