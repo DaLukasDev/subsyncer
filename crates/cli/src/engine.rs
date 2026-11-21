@@ -9,7 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use subsyncer_core::timeline::{FRAME_MS, Interval, Timeline};
 use subsyncer_core::verify::{self, CheckConfig, FullCheck, RegionCheck, SampleCheck, SampleVerdict};
-use subsyncer_core::{AlignConfig, Alignment, Format, GateConfig, Outcome, SubtitleFile, pipeline};
+use subsyncer_core::{AlignConfig, Alignment, Format, GateConfig, Outcome, SubtitleFile, classify, pipeline};
 use tracing::{debug, info, warn};
 
 use crate::cache::{Cache, FileKey};
@@ -523,8 +523,8 @@ impl Engine {
         let candidates: Vec<&media::Stream> = probe
             .text_subtitles()
             .filter(|s| {
-                let title = s.title.clone().unwrap_or_default().to_ascii_lowercase();
-                !s.forced && !title.contains("forced") && !title.contains("sign")
+                let words = s.title.as_deref().map(classify::name_words).unwrap_or_default();
+                !s.forced && !words.iter().any(|w| w.starts_with("forced") || w.starts_with("sign"))
             })
             .take(6)
             .collect();
