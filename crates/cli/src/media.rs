@@ -374,19 +374,31 @@ fn run(tools: &Tools, cmd: &mut Command, mut on_stdout: impl FnMut(&[u8]) -> Res
         if read.is_err() {
             kill();
         }
+        // Wait for the exit with the watchdog still on duty: the process may
+        // stall after its output ends (closing a file on a hung mount).
+        let status = loop {
+            // Not in the `match` itself: the lock would be held while
+            // sleeping, and the watchdog could hardly ever take it.
+            let polled = child.lock().unwrap_or_else(|e| e.into_inner()).try_wait();
+            match polled {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(e) => break Err(e),
+            }
+        };
         done.store(true, Ordering::Release);
         watchdog.thread().unpark();
         let stopped = watchdog.join().expect("watchdog thread");
-        let status = child.lock().unwrap_or_else(|e| e.into_inner()).wait();
         let stderr = err_reader.join().unwrap_or_default();
         match stopped {
             Some(Stop::Cancelled) => return Err(Cancelled.into()),
-            Some(Stop::Timeout) => bail!(
+            // Unless it finished fine just as the timeout ran out.
+            Some(Stop::Timeout) if !status.as_ref().is_ok_and(|s| s.success()) => bail!(
                 "{} made no progress for {} s and was stopped (is the file on a slow or unresponsive mount?)",
                 program.display(),
                 tools.timeout.as_secs()
             ),
-            None => {}
+            _ => {}
         }
         read?;
         Ok(Finished { status: status?, stderr })
@@ -519,6 +531,15 @@ mod tests {
         assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
         // Already cancelled: nothing is started.
         assert!(run(&tools, &mut sh("exit 0"), |_| Ok(())).err().unwrap().is::<Cancelled>());
+    }
+
+    #[test]
+    fn a_process_that_stalls_after_its_output_is_stopped() {
+        let t = Instant::now();
+        let e =
+            run(&quick(), &mut sh("echo done; exec 1>&- 2>&-; exec sleep 10"), |_| Ok(())).err().expect("timed out");
+        assert!(e.to_string().contains("made no progress"), "{e:#}");
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
     }
 
     #[test]
