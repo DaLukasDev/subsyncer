@@ -10,6 +10,7 @@ pub mod gate;
 pub mod pipeline;
 pub mod subtitle;
 pub mod timeline;
+pub mod verify;
 
 pub use align::{AlignConfig, Alignment, Mapping};
 pub use gate::{GateConfig, Outcome, Verdict};
