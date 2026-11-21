@@ -2,22 +2,45 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+
+/// Default for [`Tools::timeout`].
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Debug)]
 pub struct Tools {
     pub ffmpeg: PathBuf,
     pub ffprobe: PathBuf,
+    /// An ffmpeg/ffprobe run that produces no output for this long is
+    /// stopped (a stalled network mount would otherwise block forever).
+    pub timeout: Duration,
+    /// Once set, running ffmpeg/ffprobe processes are stopped and new ones
+    /// fail with [`Cancelled`].
+    pub cancel: Option<Arc<AtomicBool>>,
 }
 
 impl Default for Tools {
     fn default() -> Self {
-        Self { ffmpeg: "ffmpeg".into(), ffprobe: "ffprobe".into() }
+        Self { ffmpeg: "ffmpeg".into(), ffprobe: "ffprobe".into(), timeout: DEFAULT_TIMEOUT, cancel: None }
     }
 }
+
+impl Tools {
+    pub fn cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed))
+    }
+}
+
+/// The work was cancelled (see [`Tools::cancel`]).
+#[derive(Debug, thiserror::Error)]
+#[error("cancelled")]
+pub struct Cancelled;
 
 #[derive(Clone, Debug, Default)]
 pub struct Probe {
@@ -66,16 +89,17 @@ struct RawStream {
 }
 
 pub fn probe(tools: &Tools, media: &Path) -> Result<Probe> {
-    let out = Command::new(&tools.ffprobe)
-        .args(["-v", "error", "-of", "json", "-show_streams", "-show_format"])
-        .arg(media_arg(media)?)
-        .stdin(Stdio::null())
-        .output()
-        .with_context(|| format!("running {}", tools.ffprobe.display()))?;
+    let mut cmd = Command::new(&tools.ffprobe);
+    cmd.args(["-v", "error", "-of", "json", "-show_streams", "-show_format"]).arg(media_arg(media)?);
+    let mut json = Vec::new();
+    let out = run(tools, &mut cmd, |b| {
+        json.extend_from_slice(b);
+        Ok(())
+    })?;
     if !out.status.success() {
-        bail!("ffprobe failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        bail!("ffprobe failed: {}", out.stderr.trim());
     }
-    parse_probe(&out.stdout)
+    parse_probe(&json)
 }
 
 pub fn parse_probe(json: &[u8]) -> Result<Probe> {
@@ -173,51 +197,26 @@ pub fn decode_audio(
     if let Some(f) = filter {
         cmd.args(["-af", f]);
     }
-    cmd.args(["-ac", "1", "-ar", "16000", "-f", "s16le", "-acodec", "pcm_s16le", "pipe:1"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = cmd.spawn().with_context(|| format!("running {}", tools.ffmpeg.display()))?;
-    let mut stdout = child.stdout.take().expect("piped stdout");
-    let mut stderr = child.stderr.take().expect("piped stderr");
-    let err_thread = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = stderr.read_to_string(&mut s);
-        s
-    });
-    let mut buf = vec![0u8; 64 * 1024];
+    cmd.args(["-ac", "1", "-ar", "16000", "-f", "s16le", "-acodec", "pcm_s16le", "pipe:1"]);
     let mut carry: Option<u8> = None;
-    let mut samples = Vec::with_capacity(buf.len() / 2 + 1);
+    let mut samples = Vec::with_capacity(READ_BUF / 2 + 1);
     let mut total = 0u64;
-    let result = (|| -> Result<()> {
-        loop {
-            let n = stdout.read(&mut buf)?;
-            if n == 0 {
-                return Ok(());
-            }
-            samples.clear();
-            let mut bytes = &buf[..n];
-            if let Some(lo) = carry.take() {
-                samples.push(i16::from_le_bytes([lo, bytes[0]]));
-                bytes = &bytes[1..];
-            }
-            let (pairs, rest) = bytes.as_chunks::<2>();
-            samples.extend(pairs.iter().map(|&p| i16::from_le_bytes(p)));
-            if let [b] = rest {
-                carry = Some(*b);
-            }
-            total += samples.len() as u64;
-            sink(&samples)?;
+    let out = run(tools, &mut cmd, |mut bytes| {
+        samples.clear();
+        if let Some(lo) = carry.take() {
+            samples.push(i16::from_le_bytes([lo, bytes[0]]));
+            bytes = &bytes[1..];
         }
-    })();
-    if result.is_err() {
-        let _ = child.kill();
-    }
-    let status = child.wait()?;
-    let stderr = err_thread.join().unwrap_or_default();
-    result?;
-    if !status.success() {
-        bail!("ffmpeg audio decode failed: {}", stderr.trim());
+        let (pairs, rest) = bytes.as_chunks::<2>();
+        samples.extend(pairs.iter().map(|&p| i16::from_le_bytes(p)));
+        if let [b] = rest {
+            carry = Some(*b);
+        }
+        total += samples.len() as u64;
+        sink(&samples)
+    })?;
+    if !out.status.success() {
+        bail!("ffmpeg audio decode failed: {}", out.stderr.trim());
     }
     Ok(total)
 }
@@ -232,24 +231,144 @@ fn secs(ms: i64) -> String {
     format!("{}.{:03}", ms / 1000, ms % 1000)
 }
 
-/// Extract a text subtitle stream. ASS/SSA are copied as-is (keeps style
-/// info for sign detection); everything else is converted to SRT.
-pub fn extract_subtitle(tools: &Tools, media: &Path, stream: &Stream) -> Result<Vec<u8>> {
-    let (codec, fmt) = match stream.codec_name.as_str() {
-        "ass" | "ssa" => ("copy", "ass"),
-        _ => ("srt", "srt"),
-    };
-    let out = Command::new(&tools.ffmpeg)
-        .args(["-nostdin", "-hide_banner", "-v", "error", "-i"])
-        .arg(media_arg(media)?)
-        .args(["-map", &format!("0:{}", stream.index), "-c:s", codec, "-f", fmt, "pipe:1"])
-        .stdin(Stdio::null())
-        .output()
-        .with_context(|| format!("running {}", tools.ffmpeg.display()))?;
-    if !out.status.success() {
-        bail!("ffmpeg subtitle extraction failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+/// Extract text subtitle streams, all in one pass over the file. ASS/SSA are
+/// copied as-is (keeps style info for sign detection); everything else is
+/// converted to SRT. If that fails, each stream is tried on its own, so one
+/// bad stream doesn't cost the others. Results are in `streams` order.
+pub fn extract_subtitles(tools: &Tools, media: &Path, streams: &[&Stream]) -> Vec<Result<Vec<u8>>> {
+    if streams.is_empty() {
+        return Vec::new();
     }
-    Ok(out.stdout)
+    match extract_run(tools, media, streams) {
+        Ok(all) => all.into_iter().map(Ok).collect(),
+        Err(e) if e.is::<Cancelled>() => streams.iter().map(|_| Err(Cancelled.into())).collect(),
+        Err(e) if streams.len() == 1 => vec![Err(e)],
+        Err(_) => {
+            streams.iter().map(|s| extract_run(tools, media, &[s]).map(|mut v| v.pop().unwrap_or_default())).collect()
+        }
+    }
+}
+
+fn extract_run(tools: &Tools, media: &Path, streams: &[&Stream]) -> Result<Vec<Vec<u8>>> {
+    let dir = tempfile::Builder::new().prefix("subsyncer-").tempdir().context("creating a temp dir")?;
+    let mut cmd = Command::new(&tools.ffmpeg);
+    // The subtitles go to files; progress on stdout shows ffmpeg is alive
+    // while it reads through a large file.
+    cmd.args(["-nostdin", "-hide_banner", "-v", "error", "-nostats", "-progress", "pipe:1", "-y", "-i"])
+        .arg(media_arg(media)?);
+    let mut files = Vec::with_capacity(streams.len());
+    for s in streams {
+        let (codec, fmt) = match s.codec_name.as_str() {
+            "ass" | "ssa" => ("copy", "ass"),
+            _ => ("srt", "srt"),
+        };
+        let file = dir.path().join(format!("{}.{fmt}", s.index));
+        cmd.args(["-map", &format!("0:{}", s.index), "-c:s", codec, "-f", fmt]).arg(&file);
+        files.push(file);
+    }
+    let out = run(tools, &mut cmd, |_| Ok(()))?;
+    if !out.status.success() {
+        bail!("ffmpeg subtitle extraction failed: {}", out.stderr.trim());
+    }
+    files.iter().map(|f| std::fs::read(f).with_context(|| format!("reading {}", f.display()))).collect()
+}
+
+const READ_BUF: usize = 64 * 1024;
+/// Keep at most this much of a process's stderr (for error messages).
+const STDERR_LIMIT: usize = 16 * 1024;
+
+struct Finished {
+    status: ExitStatus,
+    stderr: String,
+}
+
+enum Stop {
+    Cancelled,
+    Timeout,
+}
+
+/// Run `cmd`, passing its stdout to `on_stdout` as it arrives. A watchdog
+/// kills the process when it produces no output on stdout or stderr for
+/// `tools.timeout`, or when `tools.cancel` is set; both are errors. A
+/// non-zero exit is not: the caller words that error from `stderr`.
+fn run(tools: &Tools, cmd: &mut Command, mut on_stdout: impl FnMut(&[u8]) -> Result<()>) -> Result<Finished> {
+    if tools.cancelled() {
+        return Err(Cancelled.into());
+    }
+    let program = PathBuf::from(cmd.get_program());
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().with_context(|| format!("running {}", program.display()))?;
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let child = Mutex::new(child);
+    let kill = || {
+        let _ = child.lock().unwrap_or_else(|e| e.into_inner()).kill();
+    };
+    let start = Instant::now();
+    // When output was last seen, in ms after `start`.
+    let last_output = AtomicU64::new(0);
+    let touch = || last_output.store(start.elapsed().as_millis() as u64, Ordering::Relaxed);
+    let done = AtomicBool::new(false);
+    std::thread::scope(|s| {
+        let err_reader = s.spawn(move || {
+            let mut text = Vec::new();
+            let mut buf = [0u8; 4096];
+            while let Ok(n @ 1..) = stderr.read(&mut buf) {
+                touch();
+                let keep = n.min(STDERR_LIMIT.saturating_sub(text.len()));
+                text.extend_from_slice(&buf[..keep]);
+            }
+            String::from_utf8_lossy(&text).into_owned()
+        });
+        let watchdog = s.spawn(|| {
+            while !done.load(Ordering::Acquire) {
+                let idle = start.elapsed().saturating_sub(Duration::from_millis(last_output.load(Ordering::Relaxed)));
+                let stop = if tools.cancelled() {
+                    Some(Stop::Cancelled)
+                } else if idle >= tools.timeout {
+                    Some(Stop::Timeout)
+                } else {
+                    None
+                };
+                if stop.is_some() {
+                    kill();
+                    return stop;
+                }
+                std::thread::park_timeout(Duration::from_millis(100));
+            }
+            None
+        });
+        let mut buf = vec![0u8; READ_BUF];
+        let read = (|| -> Result<()> {
+            loop {
+                let n = stdout.read(&mut buf)?;
+                if n == 0 {
+                    return Ok(());
+                }
+                touch();
+                on_stdout(&buf[..n])?;
+            }
+        })();
+        if read.is_err() {
+            kill();
+        }
+        done.store(true, Ordering::Release);
+        watchdog.thread().unpark();
+        let stopped = watchdog.join().expect("watchdog thread");
+        let status = child.lock().unwrap_or_else(|e| e.into_inner()).wait();
+        let stderr = err_reader.join().unwrap_or_default();
+        match stopped {
+            Some(Stop::Cancelled) => return Err(Cancelled.into()),
+            Some(Stop::Timeout) => bail!(
+                "{} made no progress for {} s and was stopped (is the file on a slow or unresponsive mount?)",
+                program.display(),
+                tools.timeout.as_secs()
+            ),
+            None => {}
+        }
+        read?;
+        Ok(Finished { status: status?, stderr })
+    })
 }
 
 /// Check that ffmpeg and ffprobe can be executed.
@@ -310,5 +429,108 @@ mod tests {
         assert_eq!(subs[0].language.as_deref(), Some("dut"));
         assert_eq!(dialogue_filter(&p.streams[1]).as_deref(), Some("pan=mono|c0=FC"));
         assert_eq!(dialogue_filter(&p.streams[2]), None);
+    }
+
+    fn sh(script: &str) -> Command {
+        let mut c = Command::new("/bin/sh");
+        c.args(["-c", script]);
+        c
+    }
+
+    fn quick() -> Tools {
+        Tools { timeout: Duration::from_millis(400), ..Tools::default() }
+    }
+
+    #[test]
+    fn silent_process_is_stopped() {
+        let t = Instant::now();
+        let e = run(&quick(), &mut sh("exec sleep 10"), |_| Ok(())).err().expect("timed out");
+        assert!(e.to_string().contains("made no progress"), "{e:#}");
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn steady_output_keeps_a_process_alive() {
+        let mut lines = 0;
+        let out = run(&quick(), &mut sh("for i in 1 2 3 4 5 6 7 8; do echo x; sleep 0.1; done"), |b| {
+            lines += b.iter().filter(|&&c| c == b'\n').count();
+            Ok(())
+        })
+        .unwrap();
+        assert!(out.status.success());
+        assert_eq!(lines, 8);
+    }
+
+    #[test]
+    fn cancelling_stops_a_process() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let tools = Tools { cancel: Some(cancel.clone()), timeout: Duration::from_secs(60), ..Tools::default() };
+        let flag = cancel.clone();
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            flag.store(true, Ordering::Relaxed);
+        });
+        let t = Instant::now();
+        let e = run(&tools, &mut sh("exec sleep 10"), |_| Ok(())).err().expect("cancelled");
+        setter.join().unwrap();
+        assert!(e.is::<Cancelled>(), "{e:#}");
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+        // Already cancelled: nothing is started.
+        assert!(run(&tools, &mut sh("exit 0"), |_| Ok(())).err().unwrap().is::<Cancelled>());
+    }
+
+    #[test]
+    fn failure_keeps_stderr() {
+        let out = run(&quick(), &mut sh("echo oops >&2; exit 3"), |_| Ok(())).unwrap();
+        assert_eq!(out.status.code(), Some(3));
+        assert_eq!(out.stderr.trim(), "oops");
+    }
+
+    /// Whether ffmpeg is installed (media tests are skipped without it).
+    pub(crate) fn have_ffmpeg() -> bool {
+        let ok = check_tools(&Tools::default()).is_ok();
+        if !ok {
+            eprintln!("ffmpeg/ffprobe not found; skipping");
+        }
+        ok
+    }
+
+    #[test]
+    fn extracts_several_subtitle_streams_in_one_pass() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        std::fs::write(
+            p.join("a.srt"),
+            "1\n00:00:01,000 --> 00:00:02,000\nHello\n\n2\n00:00:03,000 --> 00:00:04,000\nBye\n",
+        )
+        .unwrap();
+        std::fs::write(
+            p.join("b.ass"),
+            "[Script Info]\nScriptType: v4.00+\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,Hallo\n",
+        )
+        .unwrap();
+        let mkv = p.join("-odd: name.mkv");
+        let status = Command::new("ffmpeg")
+            .args(["-v", "error", "-f", "lavfi", "-t", "5", "-i", "anullsrc=r=16000:cl=mono", "-i"])
+            .arg(p.join("a.srt"))
+            .arg("-i")
+            .arg(p.join("b.ass"))
+            .args(["-map", "0", "-map", "1", "-map", "2", "-c:a", "pcm_s16le", "-c:s", "copy"])
+            .arg(&mkv)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let tools = Tools::default();
+        let probe = probe(&tools, &mkv).unwrap();
+        let subs: Vec<&Stream> = probe.text_subtitles().collect();
+        assert_eq!(subs.len(), 2);
+        let got = extract_subtitles(&tools, &mkv, &subs);
+        let srt = String::from_utf8(got[0].as_ref().unwrap().clone()).unwrap();
+        let ass = String::from_utf8(got[1].as_ref().unwrap().clone()).unwrap();
+        assert!(srt.contains("00:00:03,000 --> 00:00:04,000"), "{srt}");
+        assert!(ass.contains("Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,Hallo"), "{ass}");
     }
 }

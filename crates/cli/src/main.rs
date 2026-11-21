@@ -133,8 +133,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
     match cli.cmd {
         Cmd::Sync { video, subtitle, reference, dry_run, output, no_backup, json } => {
             let engine = Engine::new(settings, open_cache(&cli.global, false)?);
-            let req =
-                SyncRequest { video, subtitle, reference, dry_run, output, backup: cli.global.backup && !no_backup };
+            let backup = cli.global.backup && !no_backup;
+            let req = SyncRequest { video, subtitle, reference, dry_run, output, backup, ..Default::default() };
             let report = engine.sync(&req);
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);

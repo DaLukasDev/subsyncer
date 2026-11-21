@@ -3,6 +3,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -83,7 +84,7 @@ impl Default for Settings {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct SyncRequest {
     pub video: PathBuf,
     pub subtitle: PathBuf,
@@ -92,6 +93,15 @@ pub struct SyncRequest {
     /// Write here instead of replacing the subtitle.
     pub output: Option<PathBuf>,
     pub backup: bool,
+    /// Once set, the sync stops (ffmpeg is killed) and fails as cancelled,
+    /// without writing anything.
+    pub cancel: Option<Arc<AtomicBool>>,
+}
+
+impl SyncRequest {
+    pub fn cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -303,6 +313,9 @@ impl Engine {
         if !v.should_write() || req.dry_run {
             return Ok(());
         }
+        if req.cancelled() {
+            return Err(media::Cancelled.into());
+        }
         let out = result.render(&file).context("rendering subtitle")?;
         let target = req.output.clone().unwrap_or_else(|| req.subtitle.clone());
         let backup = req.backup && req.output.is_none();
@@ -320,21 +333,14 @@ impl Engine {
         mode: ReferenceMode,
         target_cues: usize,
     ) -> Result<(Timeline, String)> {
-        let req = SyncRequest {
-            video: video.to_path_buf(),
-            subtitle: PathBuf::new(),
-            reference: mode,
-            dry_run: true,
-            output: None,
-            backup: false,
-        };
+        let req = SyncRequest { video: video.to_path_buf(), reference: mode, dry_run: true, ..Default::default() };
         let r = self.reference(&req, target_cues, &mut SyncReport::default())?;
         Ok((r.timeline, r.label))
     }
 
     /// Build the reference according to the requested mode.
     fn reference(&self, req: &SyncRequest, target_cues: usize, report: &mut SyncReport) -> Result<Reference> {
-        let probe = media::probe(&self.settings.tools, &req.video)?;
+        let probe = media::probe(&self.tools(req), &req.video)?;
         if req.reference != ReferenceMode::Audio {
             match self.embedded_reference(req, &probe, target_cues) {
                 Ok(Some(track)) => {
@@ -366,7 +372,7 @@ impl Engine {
                 }
                 Ok(None) if req.reference == ReferenceMode::Embedded => bail!("no usable embedded text subtitle"),
                 Ok(None) => {}
-                Err(e) if req.reference == ReferenceMode::Embedded => return Err(e),
+                Err(e) if req.reference == ReferenceMode::Embedded || e.is::<media::Cancelled>() => return Err(e),
                 Err(e) => warn!("embedded subtitle reference failed, using audio: {e:#}"),
             }
         }
@@ -534,10 +540,12 @@ impl Engine {
             })
             .take(6)
             .collect();
+        let extracted = media::extract_subtitles(&self.tools(req), &req.video, &candidates);
         let mut best: Option<(usize, Timeline, Vec<Interval>)> = None;
-        for s in candidates {
-            let bytes = match media::extract_subtitle(&self.settings.tools, &req.video, s) {
+        for (s, bytes) in candidates.into_iter().zip(extracted) {
+            let bytes = match bytes {
                 Ok(b) => b,
+                Err(e) if e.is::<media::Cancelled>() => return Err(e),
                 Err(e) => {
                     warn!(stream = s.index, "extracting embedded subtitle: {e:#}");
                     continue;
@@ -582,11 +590,11 @@ impl Engine {
         }
         let key = FileKey::of(&req.video).ok();
         let t = Instant::now();
-        let tl = match self.detect_speech(&req.video, stream.index, filter.as_deref()) {
+        let tl = match self.detect_speech(req, stream.index, filter.as_deref()) {
             Ok(tl) => tl,
-            Err(e) if filter.is_some() => {
+            Err(e) if filter.is_some() && !e.is::<media::Cancelled>() => {
                 warn!("centre-channel decode failed ({e:#}); retrying with downmix");
-                self.detect_speech(&req.video, stream.index, None)?
+                self.detect_speech(req, stream.index, None)?
             }
             Err(e) => return Err(e),
         };
@@ -624,9 +632,14 @@ impl Engine {
         }
     }
 
-    fn detect_speech(&self, video: &Path, stream: usize, filter: Option<&str>) -> Result<Timeline> {
+    /// The tools for one request: its cancel flag stops ffmpeg.
+    fn tools(&self, req: &SyncRequest) -> Tools {
+        Tools { cancel: req.cancel.clone(), ..self.settings.tools.clone() }
+    }
+
+    fn detect_speech(&self, req: &SyncRequest, stream: usize, filter: Option<&str>) -> Result<Timeline> {
         let mut det = SpeechDetector::new()?;
-        media::decode_audio(&self.settings.tools, video, stream, filter, None, |s| det.push_s16(s))?;
+        media::decode_audio(&self.tools(req), &req.video, stream, filter, None, |s| det.push_s16(s))?;
         if det.samples() == 0 {
             bail!("audio stream decoded to zero samples");
         }
@@ -645,12 +658,12 @@ impl Engine {
         let run = |filter: Option<&str>| -> Result<Timeline> {
             let mut det = SpeechDetector::new()?;
             let range = Some((start_ms, len_ms));
-            media::decode_audio(&self.settings.tools, &req.video, stream.index, filter, range, |s| det.push_s16(s))?;
+            media::decode_audio(&self.tools(req), &req.video, stream.index, filter, range, |s| det.push_s16(s))?;
             Ok(det.finish()?.0)
         };
         let filter = media::dialogue_filter(stream);
         match run(filter.as_deref()) {
-            Err(e) if filter.is_some() => {
+            Err(e) if filter.is_some() && !e.is::<media::Cancelled>() => {
                 debug!("centre-channel decode failed ({e:#}); retrying with downmix");
                 run(None)
             }

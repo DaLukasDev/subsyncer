@@ -2,6 +2,7 @@
 //! `SUBSYNCER_*` environment variable.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Result, bail};
 use clap::Args;
@@ -71,12 +72,25 @@ pub struct GlobalOpts {
 
     #[arg(long, env = "SUBSYNCER_FFPROBE", default_value = "ffprobe", global = true)]
     pub ffprobe: PathBuf,
+
+    /// Stop an ffmpeg/ffprobe run that makes no progress for this many
+    /// seconds (e.g. a file on a hung network mount).
+    #[arg(long, env = "SUBSYNCER_FFMPEG_TIMEOUT_SECS", default_value_t = 120.0, global = true)]
+    pub ffmpeg_timeout_secs: f64,
 }
 
 impl GlobalOpts {
     pub fn settings(&self) -> Result<Settings> {
+        if !(self.ffmpeg_timeout_secs.is_finite() && self.ffmpeg_timeout_secs > 0.0) {
+            bail!("ffmpeg timeout must be a positive number of seconds");
+        }
         let mut s = Settings {
-            tools: Tools { ffmpeg: self.ffmpeg.clone(), ffprobe: self.ffprobe.clone() },
+            tools: Tools {
+                ffmpeg: self.ffmpeg.clone(),
+                ffprobe: self.ffprobe.clone(),
+                timeout: Duration::from_secs_f64(self.ffmpeg_timeout_secs),
+                cancel: None,
+            },
             embedded_check: self.embedded_check,
             ..Default::default()
         };

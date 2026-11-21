@@ -133,6 +133,7 @@ pub fn scan(
             dry_run: opts.dry_run,
             output: None,
             backup: opts.backup,
+            cancel: None,
         };
         let report = engine.sync(&req);
         match report.outcome {

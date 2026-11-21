@@ -90,6 +90,7 @@ async fn serve(engine: Arc<Engine>, cfg: ServerConfig) -> Result<()> {
             dry_run: j.dry_run,
             output: None,
             backup: app.cfg.backup,
+            cancel: None,
         };
         app.queue().push_back(QueuedJob { id: j.id, req });
     }
@@ -280,8 +281,14 @@ async fn post_sync(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes)
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("db: {e:#}") }))).into_response();
         }
     };
-    let req =
-        SyncRequest { video: video_path, subtitle: sub_path, reference, dry_run, output: None, backup: app.cfg.backup };
+    let req = SyncRequest {
+        video: video_path,
+        subtitle: sub_path,
+        reference,
+        dry_run,
+        backup: app.cfg.backup,
+        ..Default::default()
+    };
     info!(job = id, subtitle = %req.subtitle.display(), "job queued");
     app.queue().push_back(QueuedJob { id, req });
     app.notify.notify_one();
