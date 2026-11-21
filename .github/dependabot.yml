@@ -1,10 +1,14 @@
 # Weekly dependency updates, grouped so each ecosystem is one pull request.
+# Commits and pull request titles start with the ⬆️ gitmoji, like the rest
+# of the history: "⬆️ Bump clap from 4.6.7 to 4.6.8".
 version: 2
 updates:
   - package-ecosystem: cargo
     directory: /
     schedule:
       interval: weekly
+    commit-message:
+      prefix: "⬆️"
     groups:
       cargo:
         patterns: ["*"]
@@ -15,6 +19,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    commit-message:
+      prefix: "⬆️"
     groups:
       actions:
         patterns: ["*"]
