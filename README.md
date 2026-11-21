@@ -40,7 +40,7 @@ original is kept as `<subtitle>.bak`.
 You need Docker with Compose, and Bazarr running in Docker on the same machine.
 
 The image is `ghcr.io/dalukasdev/subsyncer` (amd64 and arm64): `:latest` is
-the newest release, `:0.1` the newest 0.1.x, a full version like `:0.1.1` pins
+the newest release, `:0.2` the newest 0.2.x, a full version like `:0.2.0` pins
 one, and `:edge` follows the `main` branch.
 
 ### 1. Add subsyncer next to Bazarr
@@ -277,7 +277,7 @@ your `PATH`. You also need `ffmpeg` and `ffprobe` installed, and glibc 2.38 or
 newer (Ubuntu 24.04+, Debian 13+, Fedora 39+).
 
 ```sh
-v=v0.1.1   # the release you downloaded
+v=v0.2.0   # the release you downloaded
 tar xzf subsyncer-$v-x86_64-unknown-linux-gnu.tar.gz
 ./subsyncer-$v-x86_64-unknown-linux-gnu/subsyncer sync movie.mkv movie.en.srt
 ```
