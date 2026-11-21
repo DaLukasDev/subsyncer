@@ -52,6 +52,13 @@ enum Cmd {
         /// Require this key in the X-Api-Key header.
         #[arg(long, env = "SUBSYNCER_API_KEY", hide_env_values = true)]
         api_key: Option<String>,
+        /// Only accept files under these directories (comma-separated, as
+        /// subsyncer sees them). Default: any.
+        #[arg(long, env = "SUBSYNCER_ALLOWED_DIRS", value_delimiter = ',')]
+        allowed_dirs: Vec<PathBuf>,
+        /// Delete finished jobs after this many days (0 keeps them).
+        #[arg(long, env = "SUBSYNCER_JOB_RETENTION_DAYS", default_value_t = 30)]
+        job_retention_days: u64,
     },
     /// Print the detected speech intervals of a media file (debugging).
     #[command(hide = true)]
@@ -149,7 +156,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             Ok(exit_code(&report))
         }
-        Cmd::Serve { listen, workers, api_key } => {
+        Cmd::Serve { listen, workers, api_key, allowed_dirs, job_retention_days } => {
             let cache = open_cache(&cli.global, true)?
                 .ok_or_else(|| anyhow::anyhow!("serve needs a data directory (SUBSYNCER_DATA_DIR)"))?;
             let engine = Arc::new(Engine::new(settings, Some(cache)));
@@ -159,6 +166,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 api_key: api_key.filter(|k| !k.is_empty()),
                 path_map: cli.global.path_map()?,
                 backup: cli.global.backup,
+                allowed_dirs: allowed_dirs.into_iter().filter(|d| !d.as_os_str().is_empty()).collect(),
+                job_retention: (job_retention_days > 0)
+                    .then(|| std::time::Duration::from_secs(job_retention_days.saturating_mul(24 * 3600))),
             };
             subsyncer::server::run(engine, cfg)?;
             Ok(ExitCode::SUCCESS)

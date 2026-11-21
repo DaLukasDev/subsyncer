@@ -30,3 +30,6 @@ rusqlite.workspace = true
 tempfile.workspace = true
 walkdir.workspace = true
 serde_urlencoded.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5.3", default-features = false, features = ["util"] }
