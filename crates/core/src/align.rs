@@ -272,31 +272,12 @@ pub fn align(reference: &Timeline, cues: &[Interval], cfg: &AlignConfig) -> Alig
 /// Detrended correlation-peak prominence of one segment's cues on their own,
 /// over offsets `segment offset ± window`.
 fn segment_prominence(reference: &Timeline, scaled: &[Interval], seg: &Segment, window_ms: i64) -> f64 {
-    let cues = &scaled[seg.first_cue..=seg.last_cue];
-    let frames: Vec<(i64, i64)> = cues.iter().map(|c| c.frames()).collect();
-    let (Some(span_lo), Some(span_hi)) = (frames.iter().map(|f| f.0).min(), frames.iter().map(|f| f.1).max()) else {
-        return 0.0;
-    };
-    // Prefix sums of the reference as ±1, zero outside.
-    let nr = reference.len() as i64;
-    let mut p = Vec::with_capacity(reference.len() + 1);
-    p.push(0i64);
-    for &b in reference.frames() {
-        p.push(p.last().unwrap() + if b { 1 } else { -1 });
-    }
-    let q = |x: i64| p[x.clamp(0, nr) as usize];
+    let frames: Vec<(i64, i64)> = scaled[seg.first_cue..=seg.last_cue].iter().map(|c| c.frames()).collect();
     let w = window_ms / FRAME_MS;
-    let center = seg.offset_ms.div_euclid(FRAME_MS);
-    let span = (span_hi - span_lo).max(1) as f64;
-    // Segment signal: +1 inside cues, -1 in the gaps between them.
-    let curve: Vec<f64> = (-w..=w)
-        .map(|j| {
-            let d = center + j;
-            let all = q(span_hi + d) - q(span_lo + d);
-            let inside: i64 = frames.iter().map(|&(a, b)| q(b + d) - q(a + d)).sum();
-            (2 * inside - all) as f64 / span
-        })
-        .collect();
+    let curve = span_correlation(reference, &frames, seg.offset_ms.div_euclid(FRAME_MS), w);
+    if curve.is_empty() {
+        return 0.0;
+    }
     let hp = detrend(&curve, (3000 / FRAME_MS) as usize);
     // Peak near the chosen offset (the DP objective differs slightly from
     // plain correlation).
@@ -306,6 +287,36 @@ fn segment_prominence(reference: &Timeline, scaled: &[Interval], seg: &Segment, 
         .max_by(|&a, &b| hp[a].total_cmp(&hp[b]))
         .unwrap_or(mid);
     peak_prominence(&hp, peak, (1000 / FRAME_MS) as usize)
+}
+
+/// Correlation of a group of cues with the reference, for offsets
+/// `center + j` frames with `j` in `-w..=w` (element `j + w`).
+///
+/// The cue signal is +1 inside the cues and -1 in the gaps between them,
+/// over the span from the first cue start to the last cue end. The reference
+/// counts as +1 for speech, -1 for non-speech and 0 outside the timeline.
+/// Scores are normalized by the span length. Empty if there are no cues.
+pub(crate) fn span_correlation(reference: &Timeline, frames: &[(i64, i64)], center: i64, w: i64) -> Vec<f64> {
+    let (Some(span_lo), Some(span_hi)) = (frames.iter().map(|f| f.0).min(), frames.iter().map(|f| f.1).max()) else {
+        return Vec::new();
+    };
+    // Prefix sums of the reference as ±1, zero outside.
+    let nr = reference.len() as i64;
+    let mut p = Vec::with_capacity(reference.len() + 1);
+    p.push(0i64);
+    for &b in reference.frames() {
+        p.push(p.last().unwrap() + if b { 1 } else { -1 });
+    }
+    let q = |x: i64| p[x.clamp(0, nr) as usize];
+    let span = (span_hi - span_lo).max(1) as f64;
+    (-w..=w)
+        .map(|j| {
+            let d = center + j;
+            let all = q(span_hi + d) - q(span_lo + d);
+            let inside: i64 = frames.iter().map(|&(a, b)| q(b + d) - q(a + d)).sum();
+            (2 * inside - all) as f64 / span
+        })
+        .collect()
 }
 
 /// Piecewise search for one ratio candidate. Returns the merged segments
@@ -446,7 +457,7 @@ pub fn global_align(reference: &Timeline, cues: &[Interval], cfg: &AlignConfig) 
 }
 
 /// Subtract a centred moving average of half-width `w`.
-fn detrend(curve: &[f64], w: usize) -> Vec<f64> {
+pub(crate) fn detrend(curve: &[f64], w: usize) -> Vec<f64> {
     let n = curve.len();
     let mut pre = Vec::with_capacity(n + 1);
     pre.push(0.0);
@@ -491,7 +502,7 @@ fn strong_peaks(curve: &[f64], min_z: f64, sep: usize, max: usize) -> Vec<usize>
 }
 
 /// z-score of the peak against the curve outside ±`exclude` of it.
-fn peak_prominence(curve: &[f64], peak: usize, exclude: usize) -> f64 {
+pub(crate) fn peak_prominence(curve: &[f64], peak: usize, exclude: usize) -> f64 {
     let rest: Vec<f64> =
         curve.iter().enumerate().filter(|(j, _)| j.abs_diff(peak) > exclude).map(|(_, &v)| v).collect();
     if rest.len() < 2 {
