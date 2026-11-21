@@ -160,6 +160,9 @@ pub struct EmbeddedCheckReport {
     pub sample_verdict: Option<SampleVerdict>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub full: Option<FullCheck>,
+    /// Taken from the cache: an earlier sync of the same video checked it.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub cached: bool,
     /// Checks of the regions the segments of a split result rely on.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub regions: Vec<RegionCheck>,
@@ -169,6 +172,7 @@ pub struct EmbeddedCheckReport {
 /// An embedded subtitle track picked as the reference candidate.
 struct EmbeddedTrack {
     label: String,
+    stream: usize,
     timeline: Timeline,
     /// Dialogue cues, time-sorted.
     cues: Vec<Interval>,
@@ -392,6 +396,27 @@ impl Engine {
         report: &mut SyncReport,
     ) -> Decision {
         let t0 = Instant::now();
+        // The verdict depends only on the track and the audio, so later
+        // subtitles for the same video reuse it.
+        let key = self.cache.as_ref().and_then(|_| FileKey::of(&req.video).ok());
+        let version = self.check_version(mode);
+        if let (Some(cache), Some(key)) = (&self.cache, &key) {
+            match cache.get_embedded_check(key, track.stream, &version) {
+                Ok(Some((used, json))) => match serde_json::from_value::<EmbeddedCheckReport>(json) {
+                    Ok(mut rep) => {
+                        rep.cached = true;
+                        let audio = self.cached_audio(req, probe);
+                        report.cache_hit |= audio.is_some();
+                        info!(track = rep.track, used, "embedded subtitle checked earlier: {}", rep.summary);
+                        report.embedded_check = Some(rep);
+                        return if used { Decision::Use { audio } } else { Decision::Reject { audio } };
+                    }
+                    Err(e) => warn!("cached check unreadable: {e:#}"),
+                },
+                Ok(None) => {}
+                Err(e) => warn!("cache read failed: {e:#}"),
+            }
+        }
         let cfg = &self.settings.check;
         let mut rep = EmbeddedCheckReport { track: track.label.clone(), ..Default::default() };
         let decision = (|| -> Result<Decision> {
@@ -474,6 +499,14 @@ impl Engine {
         if rep.method == "unchecked" {
             warn!(track = rep.track, "using embedded subtitle unchecked: {}", rep.summary);
         } else {
+            if let (Some(cache), Some(key)) = (&self.cache, &key) {
+                let stored = serde_json::to_value(&rep)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|json| cache.put_embedded_check(key, track.stream, &version, rep.used, &json));
+                if let Err(e) = stored {
+                    warn!("cache write failed: {e:#}");
+                }
+            }
             info!(
                 track = rep.track,
                 method = rep.method,
@@ -540,38 +573,52 @@ impl Engine {
             })
             .take(6)
             .collect();
-        let extracted = media::extract_subtitles(&self.tools(req), &req.video, &candidates);
-        let mut best: Option<(usize, Timeline, Vec<Interval>)> = None;
-        for (s, bytes) in candidates.into_iter().zip(extracted) {
-            let bytes = match bytes {
-                Ok(b) => b,
+        // Dialogue cues per candidate: from the cache, else extracted (all
+        // missing ones in one pass) and cached.
+        let key = self.cache.as_ref().and_then(|_| FileKey::of(&req.video).ok());
+        let cached = |s: &media::Stream| {
+            let (cache, key) = (self.cache.as_ref()?, key.as_ref()?);
+            cache.get_embedded_track(key, s.index, TRACK_VERSION).unwrap_or_else(|e| {
+                warn!("cache read failed: {e:#}");
+                None
+            })
+        };
+        let mut tracks: Vec<(&media::Stream, Option<Vec<Interval>>)> =
+            candidates.into_iter().map(|s| (s, cached(s))).collect();
+        let missing: Vec<&media::Stream> = tracks.iter().filter(|t| t.1.is_none()).map(|t| t.0).collect();
+        let extracted = media::extract_subtitles(&self.tools(req), &req.video, &missing);
+        for (s, bytes) in missing.into_iter().zip(extracted) {
+            let cues = match bytes {
+                Ok(b) => dialogue_intervals(&b),
                 Err(e) if e.is::<media::Cancelled>() => return Err(e),
                 Err(e) => {
                     warn!(stream = s.index, "extracting embedded subtitle: {e:#}");
                     continue;
                 }
             };
-            let Ok(sub) = SubtitleFile::parse(&bytes, None) else { continue };
-            let cues = sub.dialogue_cues();
-            let n = cues.len();
-            let min = (target_cues as f64 * self.settings.min_embedded_cue_ratio).ceil() as usize;
-            debug!(stream = s.index, cues = n, min, "embedded subtitle candidate");
-            if n < min.max(1) {
-                continue;
+            if let (Some(cache), Some(key)) = (&self.cache, &key)
+                && let Err(e) = cache.put_embedded_track(key, s.index, TRACK_VERSION, &cues)
+            {
+                warn!("cache write failed: {e:#}");
             }
-            if best.as_ref().is_none_or(|b| n > b.2.len()) {
-                let len_frames = probe
-                    .duration_ms
-                    .unwrap_or_else(|| cues.iter().map(|c| c.1.end_ms).max().unwrap_or(0))
-                    .max(cues.iter().map(|c| c.1.end_ms).max().unwrap_or(0))
-                    / FRAME_MS;
-                let tl = Timeline::from_intervals(cues.iter().map(|c| c.1), Some(len_frames as usize));
-                let mut ivs: Vec<Interval> = cues.iter().map(|c| c.1).collect();
-                ivs.sort();
-                best = Some((s.index, tl, ivs));
+            if let Some(t) = tracks.iter_mut().find(|t| t.0.index == s.index) {
+                t.1 = Some(cues);
             }
         }
-        Ok(best.map(|(idx, timeline, cues)| EmbeddedTrack { label: format!("embedded:{idx}"), timeline, cues }))
+        let min = ((target_cues as f64 * self.settings.min_embedded_cue_ratio).ceil() as usize).max(1);
+        let usable: Vec<(&media::Stream, Vec<Interval>)> = tracks
+            .into_iter()
+            .filter_map(|(s, cues)| {
+                let cues = cues?;
+                debug!(stream = s.index, cues = cues.len(), min, "embedded subtitle candidate");
+                (cues.len() >= min).then_some((s, cues))
+            })
+            .collect();
+        let Some((stream, cues)) = pick_track(usable) else { return Ok(None) };
+        let last_end = cues.iter().map(|c| c.end_ms).max().unwrap_or(0);
+        let len_frames = probe.duration_ms.unwrap_or(last_end).max(last_end) / FRAME_MS;
+        let timeline = Timeline::from_intervals(cues.iter().copied(), Some(len_frames as usize));
+        Ok(Some(EmbeddedTrack { label: format!("embedded:{}", stream.index), stream: stream.index, timeline, cues }))
     }
 
     fn audio_reference(
@@ -632,6 +679,13 @@ impl Engine {
         }
     }
 
+    /// Cache version of an embedded track's check: everything that can
+    /// change its verdict.
+    fn check_version(&self, mode: EmbeddedCheck) -> String {
+        let s = &self.settings;
+        crate::cache::fingerprint(&(env!("CARGO_PKG_VERSION"), vad::VAD_VERSION, mode, &s.check, &s.align))
+    }
+
     /// The tools for one request: its cancel flag stops ffmpeg.
     fn tools(&self, req: &SyncRequest) -> Tools {
         Tools { cancel: req.cancel.clone(), ..self.settings.tools.clone() }
@@ -670,6 +724,41 @@ impl Engine {
             r => r,
         }
     }
+}
+
+/// Cache version of an embedded track's dialogue cues: which cues count as
+/// dialogue can change between versions.
+const TRACK_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The dialogue cues of an extracted subtitle track, time-sorted. Empty if
+/// it can't be parsed.
+fn dialogue_intervals(bytes: &[u8]) -> Vec<Interval> {
+    let Ok(sub) = SubtitleFile::parse(bytes, None) else { return Vec::new() };
+    let mut cues: Vec<Interval> = sub.dialogue_cues().into_iter().map(|c| c.1).collect();
+    cues.sort();
+    cues
+}
+
+/// The embedded track to use as the reference: the one with the most
+/// dialogue cues. A track for the hearing impaired (SDH) is passed over for
+/// a regular one with nearly as many cues: its extra lines describe sounds,
+/// and its timing tends to follow them rather than the dialogue.
+fn pick_track(mut tracks: Vec<(&media::Stream, Vec<Interval>)>) -> Option<(&media::Stream, Vec<Interval>)> {
+    // The first of the tracks with the most cues among those `keep` allows.
+    let best = |keep: &dyn Fn(&media::Stream) -> bool| {
+        tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| keep(t.0))
+            .max_by_key(|(i, t)| (t.1.len(), std::cmp::Reverse(*i)))
+            .map(|(i, t)| (i, t.1.len()))
+    };
+    let (first, most) = best(&|_| true)?;
+    let pick = match best(&|s| !s.hearing_impaired) {
+        Some((i, n)) if n * 10 >= most * 9 => i,
+        _ => first,
+    };
+    Some(tracks.swap_remove(pick))
 }
 
 /// A low-confidence best offset this close to the end of the search range
@@ -764,6 +853,20 @@ pub fn write_atomic(target: &Path, bytes: &[u8], backup: bool) -> Result<Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sdh_tracks_give_way_to_regular_ones_with_nearly_as_many_cues() {
+        let s = |index, hearing_impaired| media::Stream { index, hearing_impaired, ..Default::default() };
+        let (a, b, c) = (s(2, false), s(3, true), s(4, false));
+        let cues = |n: i64| (0..n).map(|k| Interval::new(k * 1000, k * 1000 + 500)).collect::<Vec<_>>();
+        let pick = |t: Vec<(&media::Stream, Vec<Interval>)>| pick_track(t).map(|p| p.0.index);
+        assert_eq!(pick(vec![(&a, cues(95)), (&b, cues(100))]), Some(2));
+        assert_eq!(pick(vec![(&a, cues(80)), (&b, cues(100))]), Some(3));
+        assert_eq!(pick(vec![(&b, cues(100))]), Some(3));
+        assert_eq!(pick(vec![(&a, cues(100)), (&c, cues(100))]), Some(2), "ties go to the first");
+        assert_eq!(pick(vec![(&a, cues(90)), (&c, cues(100))]), Some(4));
+        assert_eq!(pick(vec![]), None);
+    }
 
     #[test]
     fn hint_at_the_edge_of_the_search_range() {

@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
-use subsyncer_core::Timeline;
+use subsyncer_core::{Interval, Timeline};
 
 pub struct Cache {
     conn: Mutex<Connection>,
@@ -34,6 +34,55 @@ impl FileKey {
         let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         Ok(Self { path: canon.to_string_lossy().into_owned(), size: meta.len() as i64, mtime_ns })
     }
+}
+
+/// Schema changes after the original tables, applied in order.
+/// `PRAGMA user_version` records how many have been applied. Older versions
+/// of subsyncer keep working with an upgraded database: they only add
+/// tables and columns.
+const MIGRATIONS: &[&str] = &[
+    // 1: embedded subtitle tracks (their dialogue cues) and how they fared
+    // against the audio.
+    "CREATE TABLE embedded_tracks (
+        path TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        mtime_ns INTEGER NOT NULL,
+        stream INTEGER NOT NULL,
+        version TEXT NOT NULL,
+        cues TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (path, size, mtime_ns, stream, version)
+    );
+    CREATE TABLE embedded_checks (
+        path TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        mtime_ns INTEGER NOT NULL,
+        stream INTEGER NOT NULL,
+        version TEXT NOT NULL,
+        used INTEGER NOT NULL,
+        report TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (path, size, mtime_ns, stream, version)
+    );",
+];
+
+fn migrate(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let applied: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    for (i, sql) in MIGRATIONS.iter().enumerate().skip(applied.max(0) as usize) {
+        tx.execute_batch(sql)?;
+        tx.pragma_update(None, "user_version", i as i64 + 1)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// A short, stable fingerprint of some settings, for cache versions.
+pub fn fingerprint(value: &impl serde::Serialize) -> String {
+    let bytes = serde_json::to_vec(value).unwrap_or_default();
+    // FNV-1a: stable across Rust versions, unlike the std hasher.
+    let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3));
+    format!("{hash:016x}")
 }
 
 pub fn now_secs() -> i64 {
@@ -108,6 +157,8 @@ impl Cache {
                 processed_at INTEGER NOT NULL
             );",
         )?;
+        let mut conn = conn;
+        migrate(&mut conn).with_context(|| format!("upgrading {}", path.display()))?;
         Ok(Self { conn: Mutex::new(conn), path })
     }
 
@@ -145,6 +196,83 @@ impl Cache {
         tx.execute(
             "INSERT OR REPLACE INTO timelines (path,size,mtime_ns,stream,version,frames,data,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
             params![key.path, key.size, key.mtime_ns, stream as i64, version, tl.len() as i64, tl.encode_rle(), now_secs()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The dialogue cues of an embedded subtitle track.
+    pub fn get_embedded_track(&self, key: &FileKey, stream: usize, version: &str) -> Result<Option<Vec<Interval>>> {
+        let json: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT cues FROM embedded_tracks WHERE path=?1 AND size=?2 AND mtime_ns=?3 AND stream=?4 AND version=?5",
+                params![key.path, key.size, key.mtime_ns, stream as i64, version],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(json) = json else { return Ok(None) };
+        let pairs: Vec<(i64, i64)> = serde_json::from_str(&json).context("cached embedded track")?;
+        Ok(Some(pairs.into_iter().map(|(s, e)| Interval::new(s, e)).collect()))
+    }
+
+    pub fn put_embedded_track(&self, key: &FileKey, stream: usize, version: &str, cues: &[Interval]) -> Result<()> {
+        let pairs: Vec<(i64, i64)> = cues.iter().map(|c| (c.start_ms, c.end_ms)).collect();
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM embedded_tracks WHERE path=?1 AND stream=?2 AND version=?3",
+            params![key.path, stream as i64, version],
+        )?;
+        tx.execute(
+            "INSERT INTO embedded_tracks (path,size,mtime_ns,stream,version,cues,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![key.path, key.size, key.mtime_ns, stream as i64, version, serde_json::to_string(&pairs)?, now_secs()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Whether an embedded track passed its check against the audio, and
+    /// the check's report.
+    pub fn get_embedded_check(
+        &self,
+        key: &FileKey,
+        stream: usize,
+        version: &str,
+    ) -> Result<Option<(bool, serde_json::Value)>> {
+        let row: Option<(bool, String)> = self
+            .conn()
+            .query_row(
+                "SELECT used, report FROM embedded_checks
+                 WHERE path=?1 AND size=?2 AND mtime_ns=?3 AND stream=?4 AND version=?5",
+                params![key.path, key.size, key.mtime_ns, stream as i64, version],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        match row {
+            Some((used, report)) => Ok(Some((used, serde_json::from_str(&report).context("cached check report")?))),
+            None => Ok(None),
+        }
+    }
+
+    pub fn put_embedded_check(
+        &self,
+        key: &FileKey,
+        stream: usize,
+        version: &str,
+        used: bool,
+        report: &serde_json::Value,
+    ) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM embedded_checks WHERE path=?1 AND stream=?2 AND version=?3",
+            params![key.path, stream as i64, version],
+        )?;
+        tx.execute(
+            "INSERT INTO embedded_checks (path,size,mtime_ns,stream,version,used,report,created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![key.path, key.size, key.mtime_ns, stream as i64, version, used, report.to_string(), now_secs()],
         )?;
         tx.commit()?;
         Ok(())
@@ -252,7 +380,37 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use subsyncer_core::Interval;
+
+    #[test]
+    fn migrations_are_applied_once() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(Cache::open(dir.path()).unwrap());
+        let cache = Cache::open(dir.path()).unwrap();
+        let v: i64 = cache.conn().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn embedded_tracks_and_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let key = FileKey { path: "/m/a.mkv".into(), size: 10, mtime_ns: 5 };
+        let cues = vec![Interval::new(100, 900), Interval::new(1_000, 2_000)];
+        assert!(cache.get_embedded_track(&key, 3, "v1").unwrap().is_none());
+        cache.put_embedded_track(&key, 3, "v1", &cues).unwrap();
+        assert_eq!(cache.get_embedded_track(&key, 3, "v1").unwrap(), Some(cues));
+        let newer = FileKey { mtime_ns: 6, ..key.clone() };
+        cache.put_embedded_track(&newer, 3, "v1", &[]).unwrap();
+        assert!(cache.get_embedded_track(&key, 3, "v1").unwrap().is_none(), "stale entry replaced");
+        assert_eq!(cache.get_embedded_track(&newer, 3, "v1").unwrap(), Some(vec![]));
+
+        let report = serde_json::json!({"method": "samples"});
+        cache.put_embedded_check(&key, 3, "c1", true, &report).unwrap();
+        assert_eq!(cache.get_embedded_check(&key, 3, "c1").unwrap(), Some((true, report)));
+        assert!(cache.get_embedded_check(&key, 3, "c2").unwrap().is_none());
+        assert_eq!(fingerprint(&("a", 1)), fingerprint(&("a", 1)));
+        assert_ne!(fingerprint(&("a", 1)), fingerprint(&("a", 2)));
+    }
 
     #[test]
     fn timeline_and_jobs() {

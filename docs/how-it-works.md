@@ -10,10 +10,13 @@ finding the shift (or set of shifts) that makes them line up.
 2. **Build a reference timeline** for the video.
    - *Embedded subtitles*: if the video contains a text subtitle track (subrip,
      ass, mov_text, webvtt), its timing can be the reference. The track with
-     the most dialogue cues wins. Forced/signs tracks are skipped: those with
-     the forced flag, "forced"/"signs" in the title, or fewer than 50% of the
-     target subtitle's cues. The track is used only once it has passed a check
-     against the audio ([below](#checking-embedded-tracks)).
+     the most dialogue cues wins, but a regular track is preferred over an
+     SDH one with nearly as many (90%). Forced/signs tracks are skipped: those
+     with the forced flag, "forced"/"signs" in the title, or fewer than 50% of
+     the target subtitle's cues. The track is used only once it has passed a
+     check against the audio ([below](#checking-embedded-tracks)). All
+     candidate tracks are extracted in one pass over the file, and their cues
+     and the check's verdict are cached per video file.
    - *Audio*: otherwise ffmpeg decodes the default audio stream to 16 kHz mono.
      Commentary and audio-description tracks (by disposition or title) are
      passed over while the video has another audio track.
@@ -106,7 +109,9 @@ analysed at all, the track is used unchecked, as before 0.1.1. Other modes:
 - `SUBSYNCER_EMBEDDED_CHECK=off` turns the check off.
 
 Three samples take about 1–1.5 s. The full audio of a 45-minute episode takes
-5–10 s. The job report records each check under `embedded_check`.
+5–10 s. The verdict is cached, so later subtitles for the same video skip the
+check (`"cached": true`). The job report records each check under
+`embedded_check`.
 [evaluation.md](evaluation.md#embedded-track-check) has the measurements.
 
 ## The Bazarr command

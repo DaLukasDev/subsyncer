@@ -130,7 +130,9 @@ pub fn parse_probe(json: &[u8]) -> Result<Probe> {
                 title: tag("title"),
                 default: disp("default"),
                 forced: disp("forced"),
-                hearing_impaired: disp("hearing_impaired"),
+                hearing_impaired: disp("hearing_impaired")
+                    || disp("captions")
+                    || title_words.iter().any(|w| matches!(w.as_str(), "sdh" | "cc" | "hi")),
                 commentary: disp("comment") || titled(&["comment"]),
                 audio_description: disp("visual_impaired")
                     || disp("descriptions")

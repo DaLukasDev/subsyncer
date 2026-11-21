@@ -240,6 +240,7 @@ fn print_report(r: &SyncReport) {
     }
     if let Some(ec) = &r.embedded_check {
         let how = match ec.method.as_str() {
+            _ if ec.cached => " (checked by an earlier sync of this video)".to_string(),
             "samples" => {
                 format!(" (checked with {} audio samples, {:.1}s)", ec.samples.len(), ec.elapsed_ms as f64 / 1000.0)
             }
