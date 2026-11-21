@@ -88,11 +88,47 @@ fn already_synced_has_no_splits() {
 
 #[test]
 fn mapping_segments() {
-    let m = Mapping { ratio: 1.0, segments: vec![(i64::MIN, 100), (5000, -200)] };
+    let m = Mapping { ratio: 1.0, segments: vec![(i64::MIN, 100), (5000, -200)], clips: Vec::new() };
     assert_eq!(m.apply(0, 10), 110);
     assert_eq!(m.apply(4999, 6000), 6100);
     assert_eq!(m.apply(5000, 5000), 4800);
     assert_eq!(m.splits(), 1);
+    // The first segment's tail is hidden against the second's start.
+    let m = Mapping { clips: vec![(i64::MIN, 4800), (i64::MIN, i64::MAX)], ..m };
+    assert_eq!(m.apply(4000, 4500), 4600);
+    assert_eq!(m.apply(4900, 4900), 4800);
+    assert_eq!(m.apply(4900, 5900), 4800);
+    assert_eq!(m.apply(5000, 5000), 4800);
+}
+
+#[test]
+fn extra_content_is_hidden_and_the_mapping_agrees() {
+    let (reference, truth) = synth(30 * 60_000, 9);
+    // The subtitle has 30 s of content the video lacks at ~10 min: later
+    // cues are 30 s late, and the gap holds lines with no place in the video.
+    let (cut, t) = (10 * 60_000, 30_000);
+    let mut subs: Vec<Interval> = truth
+        .iter()
+        .map(|c| if c.start_ms >= cut { Interval::new(c.start_ms + t, c.end_ms + t) } else { *c })
+        .collect();
+    let extra: Vec<Interval> =
+        (0..8).map(|k| Interval::new(cut + 1_000 + k * 3_500, cut + 3_500 + k * 3_500)).collect();
+    subs.extend(&extra);
+    subs.sort();
+    let a = align(&reference, &subs, &AlignConfig::default());
+    assert_eq!(a.splits(), 1, "segments {:?}", a.segments);
+    // Extra lines that overlap the other side's content are hidden; ones in
+    // the silence before it are left where they are.
+    let hidden = subs.iter().zip(&a.cues).filter(|(s, c)| extra.contains(s) && c.end_ms <= c.start_ms).count();
+    assert!(hidden * 2 >= extra.len(), "{hidden} of {} extra lines hidden", extra.len());
+    // Any other timestamp (sound descriptions, inline times) maps the same
+    // way as the aligned dialogue, so it is hidden along with it.
+    for (s, c) in subs.iter().zip(&a.cues) {
+        assert_eq!(
+            (a.mapping.apply(s.start_ms, s.start_ms), a.mapping.apply(s.start_ms, s.end_ms)),
+            (c.start_ms, c.end_ms)
+        );
+    }
 }
 
 #[test]

@@ -122,6 +122,8 @@ pub struct SyncReport {
     pub score_after: f64,
     pub prominence: f64,
     pub max_shift_ms: i64,
+    /// Dialogue lines the result hides: content the video doesn't have.
+    pub hidden_cues: usize,
     pub dry_run: bool,
     pub written: Option<PathBuf>,
     pub backup: Option<PathBuf>,
@@ -283,6 +285,7 @@ impl Engine {
         report.score_after = v.score_after;
         report.prominence = v.prominence;
         report.max_shift_ms = v.max_shift_ms;
+        report.hidden_cues = v.hidden_cues;
         report.segments = result
             .alignment
             .segments

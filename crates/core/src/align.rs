@@ -108,30 +108,47 @@ pub struct Segment {
 }
 
 /// Maps original subtitle times to corrected times:
-/// `t -> round(t * ratio) + offset(segment containing anchor)`.
+/// `t -> round(t * ratio) + offset(segment containing anchor)`, kept within
+/// that segment's clip bounds.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Mapping {
     pub ratio: f64,
     /// (segment start in original ms, offset ms), sorted by start. The first
     /// segment extends to -infinity.
     pub segments: Vec<(i64, i64)>,
+    /// Per segment, the corrected time range its timestamps are kept in
+    /// (`lo`, `hi`). Where a backward jump makes two segments overlap, the
+    /// side with content the video lacks is clipped against the boundary,
+    /// which hides its cues (they end up zero length). Empty means no
+    /// clipping.
+    #[serde(default)]
+    pub clips: Vec<(i64, i64)>,
 }
 
 impl Mapping {
     pub fn identity() -> Self {
-        Self { ratio: 1.0, segments: vec![(i64::MIN, 0)] }
+        Self { ratio: 1.0, segments: vec![(i64::MIN, 0)], clips: Vec::new() }
     }
     pub fn constant(ratio: f64, offset_ms: i64) -> Self {
-        Self { ratio, segments: vec![(i64::MIN, offset_ms)] }
+        Self { ratio, segments: vec![(i64::MIN, offset_ms)], clips: Vec::new() }
+    }
+    fn segment_index(&self, anchor_ms: i64) -> usize {
+        self.segments.partition_point(|&(s, _)| s <= anchor_ms).saturating_sub(1)
     }
     pub fn offset_for(&self, anchor_ms: i64) -> i64 {
-        let idx = self.segments.partition_point(|&(s, _)| s <= anchor_ms);
-        self.segments[idx.saturating_sub(1)].1
+        self.segments[self.segment_index(anchor_ms)].1
     }
     /// Map time `t`, choosing the segment by `anchor` (normally the cue
     /// start, so a cue's start and end move together).
     pub fn apply(&self, anchor_ms: i64, t_ms: i64) -> i64 {
-        scale(t_ms, self.ratio) + self.offset_for(anchor_ms)
+        let k = self.segment_index(anchor_ms);
+        let t = scale(t_ms, self.ratio) + self.segments[k].1;
+        match self.clips.get(k) {
+            // Same order as `resolve_overlaps`: the lower bound comes from
+            // the boundary before this segment, the upper from the next.
+            Some(&(lo, hi)) => t.max(lo).min(hi),
+            None => t,
+        }
     }
     pub fn splits(&self) -> usize {
         self.segments.len().saturating_sub(1)
@@ -206,7 +223,7 @@ pub fn align(reference: &Timeline, cues: &[Interval], cfg: &AlignConfig) -> Alig
         }
     }
     out.truncate(cues.len());
-    resolve_overlaps(reference, &segments, &mut out, cfg.lambda);
+    let mut clips = resolve_overlaps(reference, &segments, &mut out, cfg.lambda);
     // With splits, every segment must stand on its own: a segment fitted to
     // noise has no sharp correlation peak of its own. Weak segments are
     // merged into a neighbour until all remaining ones are convincing.
@@ -256,7 +273,7 @@ pub fn align(reference: &Timeline, cues: &[Interval], cfg: &AlignConfig) -> Alig
                 out.push(Interval::new(c.start_ms + seg.offset_ms, c.end_ms + seg.offset_ms));
             }
         }
-        resolve_overlaps(reference, &segments, &mut out, cfg.lambda);
+        clips = resolve_overlaps(reference, &segments, &mut out, cfg.lambda);
     }
     let mapping = Mapping {
         ratio,
@@ -265,6 +282,7 @@ pub fn align(reference: &Timeline, cues: &[Interval], cfg: &AlignConfig) -> Alig
             .enumerate()
             .map(|(k, s)| (if k == 0 { i64::MIN } else { cues[s.first_cue].start_ms }, s.offset_ms))
             .collect(),
+        clips,
     };
     Alignment { global, segments, mapping, cues: out, confidence }
 }
@@ -716,10 +734,12 @@ fn merge_segments(
 /// shifted cues from both sides can overlap. That happens when the subtitle
 /// contains content the video lacks. Whichever side of the overlap matches
 /// speech worse is treated as the missing content and collapsed against the
-/// boundary so cues stay in order.
-fn resolve_overlaps(reference: &Timeline, segs: &[Segment], cues: &mut [Interval], lambda: f64) {
+/// boundary so cues stay in order. Returns each segment's clip bounds (see
+/// [`Mapping::clips`]), so the file's other cues can be hidden the same way.
+fn resolve_overlaps(reference: &Timeline, segs: &[Segment], cues: &mut [Interval], lambda: f64) -> Vec<(i64, i64)> {
+    let mut clips = vec![(i64::MIN, i64::MAX); segs.len()];
     if cues.is_empty() {
-        return;
+        return clips;
     }
     let rs = RefScore::new(reference, lambda);
     let mean_score = |ivs: &[Interval]| -> f64 {
@@ -731,8 +751,8 @@ fn resolve_overlaps(reference: &Timeline, segs: &[Segment], cues: &mut [Interval
         }
         if n == 0 { 0.0 } else { s / n as f64 }
     };
-    for w in segs.windows(2) {
-        let (a, b) = (w[0], w[1]);
+    for k in 1..segs.len() {
+        let (a, b) = (segs[k - 1], segs[k]);
         if b.offset_ms >= a.offset_ms {
             continue;
         }
@@ -750,13 +770,16 @@ fn resolve_overlaps(reference: &Timeline, segs: &[Segment], cues: &mut [Interval
                 cues[i].end_ms = cues[i].end_ms.min(b_start);
                 cues[i].start_ms = cues[i].start_ms.min(cues[i].end_ms);
             }
+            clips[k - 1].1 = clips[k - 1].1.min(b_start);
         } else {
             for &i in &b_head {
                 cues[i].start_ms = cues[i].start_ms.max(a_end);
                 cues[i].end_ms = cues[i].end_ms.max(cues[i].start_ms);
             }
+            clips[k].0 = clips[k].0.max(a_end);
         }
     }
+    clips
 }
 
 /// Fraction of cue time that overlaps active reference frames.

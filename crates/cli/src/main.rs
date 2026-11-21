@@ -234,6 +234,9 @@ fn print_report(r: &SyncReport) {
                 );
             }
         }
+        if r.hidden_cues > 0 {
+            println!("  {} lines hidden: the video doesn't have that part", r.hidden_cues);
+        }
     }
     if let Some(ec) = &r.embedded_check {
         let how = match ec.method.as_str() {
