@@ -107,6 +107,17 @@ pub struct SyntheticOptions {
 
 /// Run every (seed, kind) case in parallel.
 pub fn run_synthetic(opts: &SyntheticOptions, align_cfg: &AlignConfig, gate_cfg: &GateConfig) -> Vec<CaseResult> {
+    for_each_case(opts, |seed, ep, p| {
+        evaluate_case(&format!("synthetic:{seed}"), &ep.reference, p, align_cfg, gate_cfg)
+    })
+}
+
+/// Build the episode and perturbation for every (seed, kind) and run `f` on
+/// them in parallel. Results come back in (seed, kind) order.
+pub fn for_each_case<T: Send>(
+    opts: &SyntheticOptions,
+    f: impl Fn(u64, &synth::Episode, &Perturbed) -> T + Sync,
+) -> Vec<T> {
     let jobs: Vec<(u64, Kind)> = opts.seeds.clone().flat_map(|s| opts.kinds.iter().map(move |&k| (s, k))).collect();
     let threads = opts.threads.max(1).min(jobs.len().max(1));
     let next = std::sync::atomic::AtomicUsize::new(0);
@@ -130,7 +141,7 @@ pub fn run_synthetic(opts: &SyntheticOptions, align_cfg: &AlignConfig, gate_cfg:
                     // the same episode for a given seed.
                     let mut prng = synth::Rng::new(seed ^ (kind as u64 + 1).wrapping_mul(0xA5A5_5A5A));
                     let p = perturb::perturb(kind, &ep.cues, ep.len_ms, &mut prng);
-                    let r = evaluate_case(&format!("synthetic:{seed}"), &ep.reference, &p, align_cfg, gate_cfg);
+                    let r = f(seed, &ep, &p);
                     results.lock().unwrap().push((i, r));
                 }
             });
