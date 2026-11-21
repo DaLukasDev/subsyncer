@@ -48,19 +48,36 @@ finding the shift (or set of shifts) that makes them line up.
    - **Each segment must have its own sharp correlation peak**, otherwise it is
      merged into a neighbour. Without this, a subtitle for a different video
      gets "fitted" with several spurious segments.
-   - Overlaps from removed content are collapsed so cues stay in order.
+   - Overlaps from removed content are collapsed so cues stay in order: the
+     side the video lacks is hidden (its cues become zero length), together
+     with the sound descriptions and other cues in that part. Cues moved
+     entirely before the start of the video are hidden too.
 6. **Quality gate.**
    - `already_synced`: nothing moves by 100 ms or more, or a correction of at
      most 300 ms gives no measurable gain.
-   - `low_confidence`: the peak isn't prominent enough, or the speech overlap
-     doesn't improve enough. Nothing is written.
+   - `low_confidence`: the peak isn't prominent enough, the result would hide
+     more than a quarter of the lines, or the speech overlap doesn't improve
+     enough. Nothing is written. When the best match sits at the edge of the
+     search range, the reason suggests a larger `SUBSYNCER_MAX_OFFSET_SECS`.
    - `synced`: written.
    - `failed`: an error, e.g. no audio stream or an unparsable file.
 7. **Write.** Only timestamp bytes change. Encoding (UTF-8, UTF-16 and legacy
    code pages via chardetng), BOM, line endings and all styling are preserved,
-   and an unshifted file renders byte-identical. The new file is written to a
-   temp file in the same directory, then renamed over the original. The previous
-   version is kept as `<subtitle>.bak`.
+   and an unshifted file renders byte-identical.
+   - The new file is written to a temp file in the same directory, then
+     renamed over the original, keeping its permissions (and owner, where
+     allowed). A symlinked subtitle stays a link: the file it points to is
+     replaced.
+   - The previous version is kept as `<subtitle>.bak`. A later change of the
+     same file keeps that backup, so it always holds the original; it is only
+     refreshed once something else has replaced the subtitle (a new
+     download).
+   - If the subtitle changed on disk while it was being synced (Bazarr
+     downloaded a new one), the result isn't written: the request that came
+     with the new file syncs that one.
+   - Every ffmpeg/ffprobe run is stopped if it makes no progress for
+     `SUBSYNCER_FFMPEG_TIMEOUT_SECS` (120 s), so a file on a hung network
+     share fails its job instead of blocking a worker.
 
 Formats: SRT, WebVTT (including inline karaoke timestamps) and ASS/SSA.
 

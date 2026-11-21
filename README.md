@@ -40,8 +40,8 @@ original is kept as `<subtitle>.bak`.
 You need Docker with Compose, and Bazarr running in Docker on the same machine.
 
 The image is `ghcr.io/dalukasdev/subsyncer` (amd64 and arm64): `:latest` is
-the newest release, a version tag like `:0.1.0` pins one, and `:edge` follows
-the `main` branch.
+the newest release, `:0.1` the newest 0.1.x, a full version like `:0.1.1` pins
+one, and `:edge` follows the `main` branch.
 
 ### 1. Add subsyncer next to Bazarr
 
@@ -115,7 +115,9 @@ needed, fixed.
 | `failed` | Something went wrong, e.g. the video has no audio or the file couldn't be read. The reason is in the log. Not touched. |
 
 **To undo a change**, put the backup back:
-`mv "Movie.en.srt.bak" "Movie.en.srt"`.
+`mv "Movie.en.srt.bak" "Movie.en.srt"`. If subsyncer changes the same file
+again later, the backup keeps the original; it's only replaced once a new
+subtitle arrives (a new download, say).
 
 ## Using it without Bazarr
 
@@ -150,14 +152,16 @@ All commands:
 
 ```sh
 subsyncer sync <video> <subtitle> [--reference auto|audio|embedded] [--dry-run] [--output <path>] [--no-backup] [--json]
-subsyncer scan <dir> [--dry-run] [--force] [--include-forced] [--json]
+subsyncer scan <dir> [--dry-run] [--force] [--include-forced] [--no-backup] [--jobs N] [--json]
 subsyncer serve     # the HTTP service Bazarr talks to (the image's default)
 subsyncer health    # exits 0 if the service is up (used by the Docker healthcheck)
 ```
 
 `scan` remembers what it already processed, so running it again only looks at
-new or changed files. It skips forced subtitles (`*.forced.*`) unless you pass
-`--include-forced`. `sync` exits with 0 for `synced`/`already_synced`, 2 for
+new or changed files. Files that came back `low_confidence` are tried again
+after an upgrade or a change of settings. It skips forced subtitles
+(`*.forced.*`) unless you pass `--include-forced`, and `--jobs N` works on N
+videos at once. `sync` exits with 0 for `synced`/`already_synced`, 2 for
 `low_confidence` and 1 for `failed`.
 
 ## Configuration
@@ -176,7 +180,9 @@ Everything is set with environment variables. Most setups need none besides
 | `SUBSYNCER_LOG_LEVEL` | `info` | `error`, `warn`, `info`, `debug` or `trace` |
 | `SUBSYNCER_LOG_FORMAT` | `text` | `text` or `json` |
 | `SUBSYNCER_LISTEN` | `0.0.0.0:8080` | Address of the HTTP service |
-| `SUBSYNCER_DATA_DIR` | `/data` | Where the cache and job history live. Outside Docker it falls back to `~/.cache/subsyncer`. |
+| `SUBSYNCER_ALLOWED_DIRS` | | Only sync files under these directories (comma-separated, as subsyncer sees them), e.g. `/movies,/tv` |
+| `SUBSYNCER_DATA_DIR` | `/data` | Where the cache and job history live. Outside Docker the default is `~/.cache/subsyncer`. |
+| `SUBSYNCER_JOB_RETENTION_DAYS` | `30` | Delete finished jobs from the history after this many days (`0` keeps them) |
 
 Tuning (the defaults come from the [evaluation](docs/evaluation.md)):
 
@@ -190,6 +196,7 @@ Tuning (the defaults come from the [evaluation](docs/evaluation.md)):
 | `SUBSYNCER_MIN_IMPROVEMENT` | `0.01` | How much better the result must be before writing |
 | `SUBSYNCER_EMBEDDED_CHECK` | `sampled` | How a subtitle track inside the video is checked against the audio before it's used as the reference: `sampled` (a few short audio samples, the full audio only when they don't settle it), `full` (always the full audio) or `off` (trust it) |
 | `SUBSYNCER_FFMPEG`, `SUBSYNCER_FFPROBE` | `ffmpeg`, `ffprobe` | FFmpeg binaries, outside Docker |
+| `SUBSYNCER_FFMPEG_TIMEOUT_SECS` | `120` | Stop an ffmpeg run that makes no progress for this long (a file on a hung network share) |
 
 ## Troubleshooting
 
@@ -204,6 +211,11 @@ folder mounted at `/media/tv`:
 ```yaml
       - SUBSYNCER_PATH_MAP=/tv=/media/tv
 ```
+
+#### Bazarr logs `curl: (22) ... error: 403`
+
+`SUBSYNCER_ALLOWED_DIRS` is set and the file is outside those directories (the
+log names it). Add its directory, as subsyncer sees it.
 
 #### Bazarr logs `curl: (22) ... error: 401`
 
@@ -265,8 +277,9 @@ your `PATH`. You also need `ffmpeg` and `ffprobe` installed, and glibc 2.38 or
 newer (Ubuntu 24.04+, Debian 13+, Fedora 39+).
 
 ```sh
-tar xzf subsyncer-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
-./subsyncer-v0.1.0-x86_64-unknown-linux-gnu/subsyncer sync movie.mkv movie.en.srt
+v=v0.1.1   # the release you downloaded
+tar xzf subsyncer-$v-x86_64-unknown-linux-gnu.tar.gz
+./subsyncer-$v-x86_64-unknown-linux-gnu/subsyncer sync movie.mkv movie.en.srt
 ```
 
 ## Building from source
