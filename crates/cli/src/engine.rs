@@ -7,8 +7,9 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use subsyncer_core::timeline::{FRAME_MS, Timeline};
-use subsyncer_core::{AlignConfig, Format, GateConfig, Outcome, SubtitleFile, pipeline};
+use subsyncer_core::timeline::{FRAME_MS, Interval, Timeline};
+use subsyncer_core::verify::{self, CheckConfig, FullCheck, RegionCheck, SampleCheck, SampleVerdict};
+use subsyncer_core::{AlignConfig, Alignment, Format, GateConfig, Outcome, SubtitleFile, pipeline};
 use tracing::{debug, info, warn};
 
 use crate::cache::{Cache, FileKey};
@@ -43,6 +44,20 @@ impl ReferenceMode {
     }
 }
 
+/// How an embedded subtitle track is checked against the audio before it is
+/// used as the reference (with `--reference auto`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum EmbeddedCheck {
+    /// A few short audio samples; the full audio only if they don't settle it.
+    #[default]
+    Sampled,
+    /// Always the full audio.
+    Full,
+    /// Trust embedded tracks without checking.
+    Off,
+}
+
 #[derive(Clone, Debug)]
 pub struct Settings {
     pub tools: Tools,
@@ -51,6 +66,8 @@ pub struct Settings {
     /// Embedded tracks with fewer dialogue cues than this fraction of the
     /// target's are treated as forced/signs tracks and rejected.
     pub min_embedded_cue_ratio: f64,
+    pub embedded_check: EmbeddedCheck,
+    pub check: CheckConfig,
 }
 
 impl Default for Settings {
@@ -60,6 +77,8 @@ impl Default for Settings {
             align: AlignConfig::default(),
             gate: GateConfig::default(),
             min_embedded_cue_ratio: 0.5,
+            embedded_check: EmbeddedCheck::default(),
+            check: CheckConfig::default(),
         }
     }
 }
@@ -107,7 +126,66 @@ pub struct SyncReport {
     pub written: Option<PathBuf>,
     pub backup: Option<PathBuf>,
     pub cache_hit: bool,
+    /// How an embedded subtitle track was checked against the audio.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub embedded_check: Option<EmbeddedCheckReport>,
     pub elapsed_ms: u64,
+}
+
+/// What checking an embedded subtitle track against the audio found.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct EmbeddedCheckReport {
+    /// `embedded:<stream>`
+    pub track: String,
+    /// `samples`, `samples+full`, `full`, or `unchecked` (no usable audio).
+    pub method: String,
+    /// Whether the track was used as the reference.
+    pub used: bool,
+    pub summary: String,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub samples: Vec<SampleCheck>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub sample_verdict: Option<SampleVerdict>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub full: Option<FullCheck>,
+    /// Checks of the regions the segments of a split result rely on.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub regions: Vec<RegionCheck>,
+    pub elapsed_ms: u64,
+}
+
+/// An embedded subtitle track picked as the reference candidate.
+struct EmbeddedTrack {
+    label: String,
+    timeline: Timeline,
+    /// Dialogue cues, time-sorted.
+    cues: Vec<Interval>,
+}
+
+/// The reference a subtitle is aligned against.
+struct Reference {
+    timeline: Timeline,
+    label: String,
+    probe: media::Probe,
+    /// Set when the reference is an embedded track that passed the check.
+    checked: Option<Checked>,
+}
+
+struct Checked {
+    cues: Vec<Interval>,
+    /// The full speech timeline and its label, if the check analysed it.
+    audio: Option<(Timeline, String)>,
+}
+
+enum Decision {
+    Use {
+        audio: Option<(Timeline, String)>,
+    },
+    Reject {
+        audio: Option<(Timeline, String)>,
+    },
+    /// The audio can't be analysed: use the track as it is.
+    Unchecked,
 }
 
 impl SyncReport {
@@ -160,11 +238,41 @@ impl Engine {
             bail!("video not found: {}", req.video.display());
         }
 
-        let (reference, label) = self.reference(req, dialogue.len(), report)?;
-        report.reference = Some(label);
+        let reference = self.reference(req, dialogue.len(), report)?;
+        report.reference = Some(reference.label.clone());
         let t = Instant::now();
-        let result = pipeline::sync(&file, &reference, &self.settings.align, &self.settings.gate);
+        let mut result = pipeline::sync(&file, &reference.timeline, &self.settings.align, &self.settings.gate);
         debug!(elapsed_ms = t.elapsed().as_millis() as u64, "aligned");
+        // A split result relies on the embedded track's timing in each
+        // segment's region; the samples may not have covered those.
+        if let Some(checked) = &reference.checked
+            && result.alignment.splits() > 0
+        {
+            let t = Instant::now();
+            let regions = self.check_regions(req, &reference.probe, checked, &result.alignment);
+            let failed = regions.iter().find(|r| !r.supported).copied();
+            if let Some(ec) = report.embedded_check.as_mut() {
+                ec.regions = regions;
+                ec.elapsed_ms += t.elapsed().as_millis() as u64;
+                if let Some(r) = failed {
+                    ec.used = false;
+                    ec.summary = format!("the part around {} doesn't line up with the audio", clock(r.from_ms));
+                }
+            }
+            if let Some(r) = failed {
+                warn!(
+                    track = reference.label,
+                    from = clock(r.from_ms),
+                    "embedded subtitle doesn't line up with the audio where the result splits; using the audio"
+                );
+                let (tl, label) = match &checked.audio {
+                    Some(a) => a.clone(),
+                    None => self.audio_reference(req, &reference.probe, report)?,
+                };
+                report.reference = Some(label);
+                result = pipeline::sync(&file, &tl, &self.settings.align, &self.settings.gate);
+            }
+        }
         let v = &result.verdict;
         report.outcome = Some(v.outcome);
         report.reason = v.reason.clone();
@@ -214,22 +322,196 @@ impl Engine {
             output: None,
             backup: false,
         };
-        self.reference(&req, target_cues, &mut SyncReport::default())
+        let r = self.reference(&req, target_cues, &mut SyncReport::default())?;
+        Ok((r.timeline, r.label))
     }
 
-    /// Build the reference timeline according to the requested mode.
-    fn reference(&self, req: &SyncRequest, target_cues: usize, report: &mut SyncReport) -> Result<(Timeline, String)> {
+    /// Build the reference according to the requested mode.
+    fn reference(&self, req: &SyncRequest, target_cues: usize, report: &mut SyncReport) -> Result<Reference> {
         let probe = media::probe(&self.settings.tools, &req.video)?;
         if req.reference != ReferenceMode::Audio {
             match self.embedded_reference(req, &probe, target_cues) {
-                Ok(Some(r)) => return Ok(r),
+                Ok(Some(track)) => {
+                    let mode = match req.reference {
+                        ReferenceMode::Embedded => EmbeddedCheck::Off,
+                        _ => self.settings.embedded_check,
+                    };
+                    if mode == EmbeddedCheck::Off {
+                        return Ok(Reference { timeline: track.timeline, label: track.label, probe, checked: None });
+                    }
+                    match self.check_embedded(req, &probe, &track, mode, report) {
+                        Decision::Use { audio } => {
+                            let checked = Some(Checked { cues: track.cues, audio });
+                            return Ok(Reference { timeline: track.timeline, label: track.label, probe, checked });
+                        }
+                        Decision::Reject { audio: Some((timeline, label)) } => {
+                            return Ok(Reference { timeline, label, probe, checked: None });
+                        }
+                        Decision::Reject { audio: None } => {}
+                        Decision::Unchecked => {
+                            return Ok(Reference {
+                                timeline: track.timeline,
+                                label: track.label,
+                                probe,
+                                checked: None,
+                            });
+                        }
+                    }
+                }
                 Ok(None) if req.reference == ReferenceMode::Embedded => bail!("no usable embedded text subtitle"),
                 Ok(None) => {}
                 Err(e) if req.reference == ReferenceMode::Embedded => return Err(e),
                 Err(e) => warn!("embedded subtitle reference failed, using audio: {e:#}"),
             }
         }
-        self.audio_reference(req, &probe, report)
+        let (timeline, label) = self.audio_reference(req, &probe, report)?;
+        Ok(Reference { timeline, label, probe, checked: None })
+    }
+
+    /// Check an embedded track against the audio: a few samples first, the
+    /// full audio if they don't settle it (see `subsyncer_core::verify`).
+    /// If the audio can't be analysed at all, the track is used unchecked.
+    fn check_embedded(
+        &self,
+        req: &SyncRequest,
+        probe: &media::Probe,
+        track: &EmbeddedTrack,
+        mode: EmbeddedCheck,
+        report: &mut SyncReport,
+    ) -> Decision {
+        let t0 = Instant::now();
+        let cfg = &self.settings.check;
+        let mut rep = EmbeddedCheckReport { track: track.label.clone(), ..Default::default() };
+        let decision = (|| -> Result<Decision> {
+            let stream = probe.default_audio().ok_or_else(|| anyhow!("video has no audio stream"))?;
+            let cached = self.cached_audio(req, probe);
+            if cached.is_none() && mode == EmbeddedCheck::Sampled {
+                let duration = probe.duration_ms.unwrap_or_else(|| track.timeline.duration_ms());
+                let plan = verify::plan_samples(&track.cues, duration, cfg);
+                if !plan.is_empty() {
+                    rep.method = "samples".into();
+                    let mut checks = Vec::with_capacity(plan.len());
+                    for s in &plan {
+                        match self.detect_speech_range(req, stream, s.audio_start_ms, s.audio_len_ms) {
+                            Ok(tl) => checks.push(verify::check_sample(&tl, &track.cues, s, cfg)),
+                            Err(e) => {
+                                warn!("analysing an audio sample failed, checking the full audio: {e:#}");
+                                checks.clear();
+                                break;
+                            }
+                        }
+                    }
+                    let verdict = verify::judge_samples(&checks, cfg);
+                    rep.sample_verdict = Some(verdict);
+                    rep.samples = checks;
+                    match verdict {
+                        SampleVerdict::Pass => {
+                            let offsets: Vec<String> =
+                                rep.samples.iter().map(|c| format!("{:+.2}", c.offset_ms as f64 / 1000.0)).collect();
+                            rep.summary = format!(
+                                "in sync at {} audio samples (offsets {} s)",
+                                rep.samples.len(),
+                                offsets.join(" ")
+                            );
+                            return Ok(Decision::Use { audio: None });
+                        }
+                        SampleVerdict::Fail => {
+                            rep.summary = match rep.samples.iter().find(|c| {
+                                c.prominence >= cfg.min_prominence
+                                    && (c.offset_ms - cfg.expected_lag_ms).abs() > cfg.window_tolerance_ms
+                            }) {
+                                Some(c) => format!(
+                                    "off by {:+.2} s around {}",
+                                    -(c.offset_ms - cfg.expected_lag_ms) as f64 / 1000.0,
+                                    clock(c.start_ms)
+                                ),
+                                None => format!(
+                                    "off by {:+.2} s on average",
+                                    -(verify::mean_offset(&rep.samples) - cfg.expected_lag_ms) as f64 / 1000.0
+                                ),
+                            };
+                            return Ok(Decision::Reject { audio: None });
+                        }
+                        SampleVerdict::Inconclusive => rep.method = "samples+full".into(),
+                    }
+                }
+            }
+            if rep.method.is_empty() {
+                rep.method = "full".into();
+            }
+            let audio = match cached {
+                Some(a) => {
+                    report.cache_hit = true;
+                    a
+                }
+                None => self.audio_reference(req, probe, report)?,
+            };
+            let full = verify::check_full(&audio.0, &track.cues, &self.settings.align, cfg);
+            rep.summary = full_summary(&full, cfg);
+            let accepted = full.accepted;
+            rep.full = Some(full);
+            Ok(if accepted { Decision::Use { audio: Some(audio) } } else { Decision::Reject { audio: Some(audio) } })
+        })();
+        let decision = decision.unwrap_or_else(|e| {
+            rep.method = "unchecked".into();
+            rep.summary = format!("couldn't check it against the audio ({e:#})");
+            Decision::Unchecked
+        });
+        rep.used = matches!(decision, Decision::Use { .. } | Decision::Unchecked);
+        rep.elapsed_ms = t0.elapsed().as_millis() as u64;
+        if rep.method == "unchecked" {
+            warn!(track = rep.track, "using embedded subtitle unchecked: {}", rep.summary);
+        } else {
+            info!(
+                track = rep.track,
+                method = rep.method,
+                used = rep.used,
+                elapsed_ms = rep.elapsed_ms,
+                "embedded subtitle checked: {}",
+                rep.summary
+            );
+        }
+        report.embedded_check = Some(rep);
+        decision
+    }
+
+    /// Check the embedded track in the region each segment of a split result
+    /// relies on. A region that can't be checked counts as failed.
+    fn check_regions(
+        &self,
+        req: &SyncRequest,
+        probe: &media::Probe,
+        checked: &Checked,
+        alignment: &Alignment,
+    ) -> Vec<RegionCheck> {
+        let cfg = &self.settings.check;
+        let shifts: Vec<i64> = alignment.segments.iter().map(|s| s.offset_ms).collect();
+        alignment
+            .segments
+            .iter()
+            .enumerate()
+            .map(|(k, seg)| {
+                let mapped = &alignment.cues[seg.first_cue..=seg.last_cue.min(alignment.cues.len() - 1)];
+                let from = mapped.iter().map(|c| c.start_ms).min().unwrap_or(0);
+                let to = mapped.iter().map(|c| c.end_ms).max().unwrap_or(0);
+                let alts = verify::region_alternatives(&shifts, k);
+                let s = verify::region_sample(&checked.cues, from, to, &alts, cfg);
+                let audio = match &checked.audio {
+                    Some((tl, _)) => Ok(verify::slice_for(tl, &s)),
+                    None => probe
+                        .default_audio()
+                        .ok_or_else(|| anyhow!("video has no audio stream"))
+                        .and_then(|st| self.detect_speech_range(req, st, s.audio_start_ms, s.audio_len_ms)),
+                };
+                match audio {
+                    Ok(a) => verify::check_region(&a, &checked.cues, &s, &alts, cfg),
+                    Err(e) => {
+                        warn!("analysing audio for a region check failed: {e:#}");
+                        RegionCheck { from_ms: s.start_ms, to_ms: s.start_ms + s.window_ms, ..Default::default() }
+                    }
+                }
+            })
+            .collect()
     }
 
     fn embedded_reference(
@@ -237,7 +519,7 @@ impl Engine {
         req: &SyncRequest,
         probe: &media::Probe,
         target_cues: usize,
-    ) -> Result<Option<(Timeline, String)>> {
+    ) -> Result<Option<EmbeddedTrack>> {
         let candidates: Vec<&media::Stream> = probe
             .text_subtitles()
             .filter(|s| {
@@ -246,7 +528,7 @@ impl Engine {
             })
             .take(6)
             .collect();
-        let mut best: Option<(usize, Timeline, usize)> = None;
+        let mut best: Option<(usize, Timeline, Vec<Interval>)> = None;
         for s in candidates {
             let bytes = match media::extract_subtitle(&self.settings.tools, &req.video, s) {
                 Ok(b) => b,
@@ -263,17 +545,19 @@ impl Engine {
             if n < min.max(1) {
                 continue;
             }
-            if best.as_ref().is_none_or(|b| n > b.2) {
+            if best.as_ref().is_none_or(|b| n > b.2.len()) {
                 let len_frames = probe
                     .duration_ms
                     .unwrap_or_else(|| cues.iter().map(|c| c.1.end_ms).max().unwrap_or(0))
                     .max(cues.iter().map(|c| c.1.end_ms).max().unwrap_or(0))
                     / FRAME_MS;
                 let tl = Timeline::from_intervals(cues.iter().map(|c| c.1), Some(len_frames as usize));
-                best = Some((s.index, tl, n));
+                let mut ivs: Vec<Interval> = cues.iter().map(|c| c.1).collect();
+                ivs.sort();
+                best = Some((s.index, tl, ivs));
             }
         }
-        Ok(best.map(|(idx, tl, _)| (tl, format!("embedded:{idx}"))))
+        Ok(best.map(|(idx, timeline, cues)| EmbeddedTrack { label: format!("embedded:{idx}"), timeline, cues }))
     }
 
     fn audio_reference(
@@ -284,20 +568,13 @@ impl Engine {
     ) -> Result<(Timeline, String)> {
         let stream = probe.default_audio().ok_or_else(|| anyhow!("video has no audio stream"))?;
         let filter = media::dialogue_filter(stream);
-        let version = format!("{}|{}", vad::VAD_VERSION, filter.as_deref().unwrap_or("downmix"));
+        let version = timeline_version(filter.as_deref());
         let label = format!("audio:{}", stream.index);
-        let key = FileKey::of(&req.video).ok();
-        if let (Some(cache), Some(key)) = (&self.cache, &key) {
-            match cache.get_timeline(key, stream.index, &version) {
-                Ok(Some(tl)) => {
-                    report.cache_hit = true;
-                    debug!("speech timeline cache hit");
-                    return Ok((tl, label));
-                }
-                Ok(None) => {}
-                Err(e) => warn!("cache read failed: {e:#}"),
-            }
+        if let Some(hit) = self.cached_audio(req, probe) {
+            report.cache_hit = true;
+            return Ok(hit);
         }
+        let key = FileKey::of(&req.video).ok();
         let t = Instant::now();
         let tl = match self.detect_speech(&req.video, stream.index, filter.as_deref()) {
             Ok(tl) => tl,
@@ -323,6 +600,24 @@ impl Engine {
         Ok((tl, label))
     }
 
+    /// The full speech timeline from the cache, if it's there.
+    fn cached_audio(&self, req: &SyncRequest, probe: &media::Probe) -> Option<(Timeline, String)> {
+        let stream = probe.default_audio()?;
+        let version = timeline_version(media::dialogue_filter(stream).as_deref());
+        let (cache, key) = (self.cache.as_ref()?, FileKey::of(&req.video).ok()?);
+        match cache.get_timeline(&key, stream.index, &version) {
+            Ok(Some(tl)) => {
+                debug!("speech timeline cache hit");
+                Some((tl, format!("audio:{}", stream.index)))
+            }
+            Ok(None) => None,
+            Err(e) => {
+                warn!("cache read failed: {e:#}");
+                None
+            }
+        }
+    }
+
     fn detect_speech(&self, video: &Path, stream: usize, filter: Option<&str>) -> Result<Timeline> {
         let mut det = SpeechDetector::new()?;
         media::decode_audio(&self.settings.tools, video, stream, filter, None, |s| det.push_s16(s))?;
@@ -330,6 +625,70 @@ impl Engine {
             bail!("audio stream decoded to zero samples");
         }
         Ok(det.finish()?.0)
+    }
+
+    /// Speech timeline of `[start_ms, start_ms + len_ms)` of the audio
+    /// (frame 0 is `start_ms`).
+    fn detect_speech_range(
+        &self,
+        req: &SyncRequest,
+        stream: &media::Stream,
+        start_ms: i64,
+        len_ms: i64,
+    ) -> Result<Timeline> {
+        let run = |filter: Option<&str>| -> Result<Timeline> {
+            let mut det = SpeechDetector::new()?;
+            let range = Some((start_ms, len_ms));
+            media::decode_audio(&self.settings.tools, &req.video, stream.index, filter, range, |s| det.push_s16(s))?;
+            Ok(det.finish()?.0)
+        };
+        let filter = media::dialogue_filter(stream);
+        match run(filter.as_deref()) {
+            Err(e) if filter.is_some() => {
+                debug!("centre-channel decode failed ({e:#}); retrying with downmix");
+                run(None)
+            }
+            r => r,
+        }
+    }
+}
+
+/// Cache version of a speech timeline: VAD settings plus the audio filter.
+fn timeline_version(filter: Option<&str>) -> String {
+    format!("{}|{}", vad::VAD_VERSION, filter.unwrap_or("downmix"))
+}
+
+/// `m:ss` or `h:mm:ss`.
+fn clock(ms: i64) -> String {
+    let s = ms.max(0) / 1000;
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
+    } else {
+        format!("{}:{:02}", s / 60, s % 60)
+    }
+}
+
+/// Why the full check accepted or rejected a track, in a few words.
+fn full_summary(f: &FullCheck, cfg: &CheckConfig) -> String {
+    if f.accepted {
+        return format!("in sync with the full audio (confidence {:.1})", f.confidence);
+    }
+    if f.ratio != 1.0 {
+        format!("needs a frame-rate change (x{:.5})", f.ratio)
+    } else if let Some(w) = f.disagreeing.first() {
+        format!(
+            "the part around {} is off by {:+.2} s",
+            clock(w.start_ms),
+            -(w.offset_ms - cfg.expected_lag_ms) as f64 / 1000.0
+        )
+    } else if f.max_error_ms > cfg.tolerance_ms {
+        format!("off by up to {:.2} s", f.max_error_ms as f64 / 1000.0)
+    } else if f.confidence < cfg.min_confidence {
+        format!("doesn't line up clearly with the audio (confidence {:.1})", f.confidence)
+    } else if !f.end_supported {
+        "the end doesn't line up with the audio".to_string()
+    } else {
+        "parts of it don't line up with the audio".to_string()
     }
 }
 

@@ -235,6 +235,24 @@ fn print_report(r: &SyncReport) {
             }
         }
     }
+    if let Some(ec) = &r.embedded_check {
+        let how = match ec.method.as_str() {
+            "samples" => {
+                format!(" (checked with {} audio samples, {:.1}s)", ec.samples.len(), ec.elapsed_ms as f64 / 1000.0)
+            }
+            "samples+full" => {
+                format!(" (checked with samples, then the full audio, {:.1}s)", ec.elapsed_ms as f64 / 1000.0)
+            }
+            "full" => format!(" (checked with the full audio, {:.1}s)", ec.elapsed_ms as f64 / 1000.0),
+            _ => String::new(),
+        };
+        let verdict = match (ec.used, ec.method.as_str()) {
+            (true, "unchecked") => "used unchecked",
+            (true, _) => "used",
+            (false, _) => "not used",
+        };
+        println!("  {} {verdict}: {}{how}", ec.track, ec.summary);
+    }
     println!("  {}", r.reason);
     if let Some(w) = &r.written {
         println!(

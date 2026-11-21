@@ -7,7 +7,7 @@ use anyhow::{Result, bail};
 use clap::Args;
 use clap::builder::BoolishValueParser;
 
-use crate::engine::Settings;
+use crate::engine::{EmbeddedCheck, Settings};
 use crate::media::Tools;
 
 #[derive(Args, Clone, Debug)]
@@ -45,6 +45,11 @@ pub struct GlobalOpts {
     #[arg(long, env = "SUBSYNCER_MIN_IMPROVEMENT", global = true)]
     pub min_improvement: Option<f64>,
 
+    /// How embedded subtitle tracks are checked against the audio before
+    /// being used as the timing reference.
+    #[arg(long, env = "SUBSYNCER_EMBEDDED_CHECK", value_enum, default_value_t = EmbeddedCheck::Sampled, global = true)]
+    pub embedded_check: EmbeddedCheck,
+
     /// Keep `<subtitle>.bak` when overwriting.
     #[arg(long, env = "SUBSYNCER_BACKUP", global = true, value_parser = BoolishValueParser::new(), default_value = "true")]
     pub backup: bool,
@@ -72,6 +77,7 @@ impl GlobalOpts {
     pub fn settings(&self) -> Result<Settings> {
         let mut s = Settings {
             tools: Tools { ffmpeg: self.ffmpeg.clone(), ffprobe: self.ffprobe.clone() },
+            embedded_check: self.embedded_check,
             ..Default::default()
         };
         if !(self.max_offset_secs.is_finite() && self.max_offset_secs >= 0.0) {
