@@ -1,6 +1,7 @@
 //! The sync pipeline: probe, build a reference timeline, align, gate, write.
 
 use std::io::Write;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -239,6 +240,8 @@ impl Engine {
     }
 
     fn sync_inner(&self, req: &SyncRequest, report: &mut SyncReport) -> Result<()> {
+        // To notice the subtitle being replaced while this sync runs.
+        let read_as = FileKey::of(&req.subtitle).ok();
         let bytes = std::fs::read(&req.subtitle).with_context(|| format!("reading {}", req.subtitle.display()))?;
         let hint = req.subtitle.extension().and_then(|e| e.to_str()).and_then(Format::from_extension);
         let file = SubtitleFile::parse(&bytes, hint).context("parsing subtitle")?;
@@ -321,6 +324,12 @@ impl Engine {
             return Err(media::Cancelled.into());
         }
         let out = result.render(&file).context("rendering subtitle")?;
+        // Bazarr may have downloaded a new subtitle in the meantime: writing
+        // a shifted copy of the old one over it would lose it. The request
+        // that comes with the new file syncs that one.
+        if req.output.is_none() && FileKey::of(&req.subtitle).ok() != read_as {
+            bail!("the subtitle changed on disk while it was being synced; left it alone");
+        }
         let target = req.output.clone().unwrap_or_else(|| req.subtitle.clone());
         let backup = req.backup && req.output.is_none();
         report.backup = write_atomic(&target, &out, backup)?;
@@ -826,28 +835,62 @@ pub fn backup_path(target: &Path) -> PathBuf {
 }
 
 /// Write via a temp file in the same directory and rename over the target.
-/// Returns the backup path if one was made.
+///
+/// - A symlink is followed: the file it points to is replaced (and backed
+///   up next to it), and the link stays.
+/// - The new file keeps the old one's permissions and, where allowed, its
+///   owner. A new file gets the permissions the umask allows.
+/// - With `backup`, the current file is first copied to `<file>.bak`,
+///   unless that backup is still the one from before subsyncer's last
+///   change of this file. Returns the backup path, if there is one.
 pub fn write_atomic(target: &Path, bytes: &[u8], backup: bool) -> Result<Option<PathBuf>> {
+    let is_link = std::fs::symlink_metadata(target).is_ok_and(|m| m.file_type().is_symlink());
+    let target = if is_link {
+        std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf())
+    } else {
+        target.to_path_buf()
+    };
     let dir = target.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".subsyncer-")
-        .suffix(".tmp")
-        .tempfile_in(dir)
-        .with_context(|| format!("creating temp file in {}", dir.display()))?;
+    let existing = std::fs::metadata(&target).ok();
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".subsyncer-").suffix(".tmp");
+    if existing.is_none() {
+        // The temp file is private (0600) by default; the umask still applies.
+        builder.permissions(std::fs::Permissions::from_mode(0o666));
+    }
+    let mut tmp = builder.tempfile_in(dir).with_context(|| format!("creating temp file in {}", dir.display()))?;
     tmp.write_all(bytes)?;
     tmp.as_file().sync_all()?;
-    if let Ok(meta) = std::fs::metadata(target) {
+    if let Some(meta) = &existing {
         let _ = std::fs::set_permissions(tmp.path(), meta.permissions());
+        // Only root may give a file away; anyone may keep their own.
+        let _ = std::os::unix::fs::chown(tmp.path(), Some(meta.uid()), Some(meta.gid()));
     }
-    let bak = if backup && target.exists() {
-        let b = backup_path(target);
-        std::fs::copy(target, &b).with_context(|| format!("writing backup {}", b.display()))?;
-        Some(b)
-    } else {
-        None
+    // The backup is made after the temp file is written, so the replaced
+    // file's mtime is never later than its backup's: see `backup_is_current`.
+    let bak = match (&existing, backup) {
+        (Some(meta), true) => {
+            let b = backup_path(&target);
+            if !backup_is_current(meta, &b) {
+                std::fs::copy(&target, &b).with_context(|| format!("writing backup {}", b.display()))?;
+            }
+            Some(b)
+        }
+        _ => None,
     };
-    tmp.persist(target).map_err(|e| anyhow!("replacing {}: {}", target.display(), e.error))?;
+    tmp.persist(&target).map_err(|e| anyhow!("replacing {}: {}", target.display(), e.error))?;
     Ok(bak)
+}
+
+/// Whether `bak` still holds what the file was before subsyncer last
+/// changed it: the file hasn't been modified since the backup was made.
+/// Once something else replaces the file (a new download, an edit), the
+/// backup is out of date and gets refreshed.
+fn backup_is_current(file: &std::fs::Metadata, bak: &Path) -> bool {
+    match (file.modified(), std::fs::metadata(bak).and_then(|m| m.modified())) {
+        (Ok(f), Ok(b)) => f <= b,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -905,5 +948,52 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
             .collect();
         assert!(leftovers.is_empty());
+    }
+
+    fn touch_later(path: &Path) {
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::options().write(true).open(path).unwrap().set_modified(later).unwrap();
+    }
+
+    #[test]
+    fn backup_keeps_the_original_until_the_file_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.srt");
+        let bak = backup_path(&p);
+        std::fs::write(&p, b"download 1").unwrap();
+        write_atomic(&p, b"synced 1", true).unwrap();
+        // Syncing subsyncer's own output again keeps the original.
+        write_atomic(&p, b"synced 1 again", true).unwrap();
+        assert_eq!(std::fs::read(&bak).unwrap(), b"download 1");
+        // A new download replaces the file: its backup is refreshed.
+        std::fs::write(&p, b"download 2").unwrap();
+        touch_later(&p);
+        write_atomic(&p, b"synced 2", true).unwrap();
+        assert_eq!(std::fs::read(&bak).unwrap(), b"download 2");
+        assert_eq!(std::fs::read(&p).unwrap(), b"synced 2");
+    }
+
+    #[test]
+    fn new_files_get_umask_permissions_and_links_are_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        // What the umask gives a plain new file.
+        let plain = dir.path().join("plain");
+        std::fs::write(&plain, b"").unwrap();
+        let want = std::fs::metadata(&plain).unwrap().permissions().mode() & 0o777;
+        let out = dir.path().join("out.srt");
+        assert!(write_atomic(&out, b"x", true).unwrap().is_none(), "nothing to back up");
+        assert_eq!(std::fs::metadata(&out).unwrap().permissions().mode() & 0o777, want);
+
+        let real = dir.path().join("real.srt");
+        std::fs::write(&real, b"old").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let link = dir.path().join("link.srt");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let bak = write_atomic(&link, b"new", true).unwrap().unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(&real).unwrap(), b"new");
+        assert_eq!(std::fs::metadata(&real).unwrap().permissions().mode() & 0o777, 0o640);
+        assert_eq!(bak, std::fs::canonicalize(dir.path()).unwrap().join("real.srt.bak"));
+        assert_eq!(std::fs::read(&bak).unwrap(), b"old");
     }
 }
