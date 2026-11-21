@@ -271,7 +271,7 @@ tar xzf subsyncer-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
 
 ## Building from source
 
-You need Rust 1.88 or newer, plus `ffmpeg` and `ffprobe` on `PATH` at runtime.
+You need Rust 1.92 or newer, plus `ffmpeg` and `ffprobe` on `PATH` at runtime.
 The first build downloads ONNX Runtime and needs internet access.
 
 ```sh
