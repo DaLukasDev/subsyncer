@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use subsyncer_core::classify;
 
 /// Default for [`Tools::timeout`].
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -61,6 +62,11 @@ pub struct Stream {
     pub default: bool,
     pub forced: bool,
     pub hearing_impaired: bool,
+    /// A commentary track (disposition or title).
+    pub commentary: bool,
+    /// An audio-description track for the visually impaired (disposition
+    /// or title).
+    pub audio_description: bool,
 }
 
 #[derive(Deserialize)]
@@ -112,6 +118,8 @@ pub fn parse_probe(json: &[u8]) -> Result<Probe> {
         .map(|s| {
             let tag = |k: &str| s.tags.iter().find(|(key, _)| key.eq_ignore_ascii_case(k)).map(|(_, v)| v.clone());
             let disp = |k: &str| s.disposition.get(k).copied().unwrap_or(0) != 0;
+            let title_words = tag("title").as_deref().map(classify::name_words).unwrap_or_default();
+            let titled = |prefixes: &[&str]| title_words.iter().any(|w| prefixes.iter().any(|p| w.starts_with(p)));
             Stream {
                 index: s.index,
                 codec_type: s.codec_type.clone().unwrap_or_default(),
@@ -123,6 +131,10 @@ pub fn parse_probe(json: &[u8]) -> Result<Probe> {
                 default: disp("default"),
                 forced: disp("forced"),
                 hearing_impaired: disp("hearing_impaired"),
+                commentary: disp("comment") || titled(&["comment"]),
+                audio_description: disp("visual_impaired")
+                    || disp("descriptions")
+                    || titled(&["description", "descriptive", "described"]),
             }
         })
         .collect();
@@ -134,9 +146,17 @@ impl Probe {
         self.streams.iter().filter(|s| s.codec_type == "audio")
     }
 
-    /// The default audio stream, else the first one.
+    /// The audio stream to detect speech in: the default one, else the
+    /// first. Commentary and audio-description tracks are passed over while
+    /// there is another: their speech doesn't follow the dialogue.
     pub fn default_audio(&self) -> Option<&Stream> {
-        self.audio_streams().find(|s| s.default).or_else(|| self.audio_streams().next())
+        let main = |s: &&Stream| !s.commentary && !s.audio_description;
+        let pick = |only_main: bool| {
+            let mut it = self.audio_streams().filter(move |s| !only_main || main(s));
+            let first = it.next()?;
+            Some(std::iter::once(first).chain(it).find(|s| s.default).unwrap_or(first))
+        };
+        pick(true).or_else(|| pick(false))
     }
 
     /// Text-based subtitle streams usable as a timing reference.
@@ -401,6 +421,26 @@ mod tests {
         for l in ["stereo", "mono", "2.1", "quad", "quad(side)", "3.0(back)", "6.0(front)", "6.1(front)", "downmix"] {
             assert!(!has_front_center(l), "{l}");
         }
+    }
+
+    #[test]
+    fn commentary_and_description_tracks_are_passed_over() {
+        let json = br#"{"streams":[
+            {"index":0,"codec_type":"video","codec_name":"h264"},
+            {"index":1,"codec_type":"audio","codec_name":"aac","disposition":{"default":1,"comment":1}},
+            {"index":2,"codec_type":"audio","codec_name":"aac","tags":{"title":"Audio Description"}},
+            {"index":3,"codec_type":"audio","codec_name":"ac3","tags":{"title":"English 5.1"}},
+            {"index":4,"codec_type":"audio","codec_name":"aac","tags":{"title":"Director's Commentary"}}
+        ]}"#;
+        let p = parse_probe(json).unwrap();
+        assert_eq!(p.default_audio().unwrap().index, 3);
+        assert!(p.streams[1].commentary && p.streams[4].commentary && p.streams[2].audio_description);
+        // Only commentary: still better than nothing.
+        let only = br#"{"streams":[{"index":0,"codec_type":"audio","tags":{"title":"Commentary"}}]}"#;
+        assert_eq!(parse_probe(only).unwrap().default_audio().unwrap().index, 0);
+        // A default main track wins over an earlier one.
+        let two = br#"{"streams":[{"index":0,"codec_type":"audio"},{"index":1,"codec_type":"audio","disposition":{"default":1}}]}"#;
+        assert_eq!(parse_probe(two).unwrap().default_audio().unwrap().index, 1);
     }
 
     #[test]

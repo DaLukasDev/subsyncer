@@ -15,6 +15,8 @@ finding the shift (or set of shifts) that makes them line up.
      target subtitle's cues. The track is used only once it has passed a check
      against the audio ([below](#checking-embedded-tracks)).
    - *Audio*: otherwise ffmpeg decodes the default audio stream to 16 kHz mono.
+     Commentary and audio-description tracks (by disposition or title) are
+     passed over while the video has another audio track.
      If the layout has a centre channel, that channel is used alone
      (`pan=mono|c0=FC`), because that is where dialogue lives in a surround mix.
      Silero VAD v6 runs on 512-sample windows with its state carried between
