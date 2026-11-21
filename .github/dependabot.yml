@@ -1,0 +1,20 @@
+# Weekly dependency updates, grouped so each ecosystem is one pull request.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]
+        # ort is pinned to a release candidate whose API changes between
+        # candidates: its updates come on their own.
+        exclude-patterns: ["ort", "ort-*"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

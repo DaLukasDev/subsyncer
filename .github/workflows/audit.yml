@@ -1,0 +1,27 @@
+# Known vulnerabilities in dependencies (RustSec advisory database). Runs when
+# the dependencies change and weekly, since advisories appear without them
+# changing.
+name: Audit
+
+on:
+  push:
+    branches: [main]
+    paths: [Cargo.lock, Cargo.toml, "crates/*/Cargo.toml"]
+  pull_request:
+    paths: [Cargo.lock, Cargo.toml, "crates/*/Cargo.toml"]
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit
