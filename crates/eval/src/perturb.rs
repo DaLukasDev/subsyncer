@@ -27,6 +27,10 @@ pub enum Kind {
     FramerateInsert,
     /// Subtitle for a different video (must never be written).
     WrongVideo,
+    /// The video has an extra chunk near the end (last 15 %). Not in
+    /// `ALL`: used by the embedded-track check, where the end of the file is
+    /// the hardest part to cover with samples.
+    LateInsert,
 }
 
 impl Kind {
@@ -41,6 +45,9 @@ impl Kind {
         Kind::FramerateInsert,
         Kind::WrongVideo,
     ];
+    /// Extra kinds, not run by default.
+    pub const EXTRA: [Kind; 1] = [Kind::LateInsert];
+
     pub fn name(&self) -> &'static str {
         match self {
             Kind::None => "none",
@@ -52,10 +59,11 @@ impl Kind {
             Kind::RemoveChunk => "remove_chunk",
             Kind::FramerateInsert => "framerate_insert",
             Kind::WrongVideo => "wrong_video",
+            Kind::LateInsert => "late_insert",
         }
     }
     pub fn parse(s: &str) -> Option<Kind> {
-        Kind::ALL.iter().copied().find(|k| k.name() == s)
+        Kind::ALL.iter().chain(&Kind::EXTRA).copied().find(|k| k.name() == s)
     }
 }
 
@@ -113,6 +121,11 @@ pub fn perturb(kind: Kind, truth: &[Interval], len_ms: i64, rng: &mut Rng) -> Pe
             let p2 = chunk_point(rng, &v, len_ms / 2, len_ms * 4 / 5 - t1);
             v = insert_chunk(v, p2, t2);
             (format!("video +{t1} ms at {p1} ms, +{t2} ms at {p2} ms"), v)
+        }
+        Kind::LateInsert => {
+            let t = rng.range(5_000, 40_000);
+            let p = chunk_point(rng, &base, len_ms * 85 / 100, len_ms * 97 / 100);
+            (format!("video +{t} ms at {p} ms"), insert_chunk(base, p, t))
         }
         Kind::RemoveChunk => {
             let t = rng.range(5_000, 40_000);

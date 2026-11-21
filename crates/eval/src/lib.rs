@@ -2,6 +2,7 @@
 //! CI) and a real-corpus mode.
 
 pub mod corpus;
+pub mod embedded;
 pub mod perturb;
 pub mod report;
 pub mod synth;

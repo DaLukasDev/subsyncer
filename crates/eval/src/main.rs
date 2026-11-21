@@ -5,11 +5,12 @@ use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand};
 use subsyncer::cache::Cache;
 use subsyncer::engine::{Engine, ReferenceMode, Settings};
+use subsyncer_core::verify::CheckConfig;
 use subsyncer_core::{AlignConfig, GateConfig};
 use subsyncer_eval::perturb::Kind;
 use subsyncer_eval::report::{summarize, table};
 use subsyncer_eval::synth::NoiseModel;
-use subsyncer_eval::{SyntheticOptions, corpus, run_synthetic};
+use subsyncer_eval::{SyntheticOptions, corpus, embedded, run_synthetic};
 
 #[derive(Parser)]
 #[command(name = "subsyncer-eval", about = "Evaluate subsyncer alignment quality")]
@@ -18,7 +19,7 @@ struct Cli {
     cmd: Cmd,
 }
 
-#[derive(Args, Clone)]
+#[derive(Args, Clone, Default)]
 struct Tuning {
     /// Perturbation kinds (comma-separated); default all.
     #[arg(long, value_delimiter = ',')]
@@ -66,6 +67,44 @@ enum Cmd {
         hard: bool,
         #[command(flatten)]
         tuning: Tuning,
+    },
+    /// The embedded-track check: perturbed cues play a subtitle track
+    /// embedded in the video, the synthetic speech timeline its audio.
+    Embedded {
+        #[arg(long, default_value_t = 60)]
+        seeds: u64,
+        #[arg(long, default_value_t = 0)]
+        first_seed: u64,
+        #[arg(long)]
+        hard: bool,
+        /// Perturbation kinds (comma-separated); default all.
+        #[arg(long, value_delimiter = ',')]
+        kinds: Vec<String>,
+        #[arg(long)]
+        samples: Option<usize>,
+        #[arg(long)]
+        window_secs: Option<f64>,
+        #[arg(long)]
+        pad_secs: Option<f64>,
+        #[arg(long)]
+        min_prominence: Option<f64>,
+        #[arg(long)]
+        min_cues: Option<usize>,
+        #[arg(long)]
+        scan_min_prominence: Option<f64>,
+        #[arg(long)]
+        tolerance_ms: Option<i64>,
+        /// Measured offset of an in-sync track. The synthetic speech model
+        /// has no onset lag to speak of (real Silero output lags cue starts
+        /// by about 100 ms, the production default).
+        #[arg(long, default_value_t = 0)]
+        expected_lag_ms: i64,
+        /// Print per-case results as JSON lines instead of the table.
+        #[arg(long)]
+        json: bool,
+        /// Print each wrong decision.
+        #[arg(long)]
+        show_failures: bool,
     },
     /// Real corpus: a folder of videos with known-good subtitles next to them.
     Corpus {
@@ -187,6 +226,94 @@ fn main() -> Result<()> {
             }
             if !tuning.json {
                 print!("{}", table(&rows));
+            }
+        }
+        Cmd::Embedded {
+            seeds,
+            first_seed,
+            hard,
+            kinds: kind_names,
+            samples,
+            window_secs,
+            pad_secs,
+            min_prominence,
+            min_cues,
+            scan_min_prominence,
+            tolerance_ms,
+            expected_lag_ms,
+            json,
+            show_failures,
+        } => {
+            let t = Tuning { kinds: kind_names, ..Tuning::default() };
+            let mut check_kinds = kinds(&t)?;
+            if t.kinds.is_empty() {
+                check_kinds.extend(Kind::EXTRA);
+            }
+            let opts = SyntheticOptions {
+                seeds: first_seed..first_seed + seeds,
+                kinds: check_kinds,
+                noise: if hard { NoiseModel::hard() } else { NoiseModel::default() },
+                threads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
+            };
+            let mut cfg = CheckConfig::default();
+            if let Some(v) = samples {
+                cfg.samples = v;
+            }
+            if let Some(v) = window_secs {
+                cfg.window_ms = (v * 1000.0) as i64;
+            }
+            if let Some(v) = pad_secs {
+                cfg.pad_ms = (v * 1000.0) as i64;
+            }
+            if let Some(v) = min_prominence {
+                cfg.min_prominence = v;
+            }
+            if let Some(v) = min_cues {
+                cfg.min_cues = v;
+            }
+            if let Some(v) = scan_min_prominence {
+                cfg.scan_min_prominence = v;
+            }
+            if let Some(v) = tolerance_ms {
+                cfg.tolerance_ms = v;
+            }
+            cfg.expected_lag_ms = expected_lag_ms;
+            let cases = embedded::run(&opts, &AlignConfig::default(), &cfg);
+            if json {
+                for c in &cases {
+                    println!("{}", serde_json::to_string(c)?);
+                }
+            } else {
+                print!("{}", embedded::table(&cases, &cfg));
+            }
+            if show_failures {
+                for c in cases.iter().filter(|c| c.accepted == c.bad) {
+                    let s: Vec<String> = c
+                        .samples
+                        .iter()
+                        .map(|s| format!("{}@{}s:{:+}ms/z{:.1}", s.cues, s.start_ms / 1000, s.offset_ms, s.prominence))
+                        .collect();
+                    eprintln!(
+                        "  {} seed {} ({}): {} | samples {:?} [{}] | full ok={} err {} ms conf {:.1} ratio {:.4} splits {} windows {} disagree {:?}",
+                        c.kind.name(),
+                        c.seed,
+                        c.desc,
+                        if c.accepted { "FALSE ACCEPT" } else { "false reject" },
+                        c.sample_verdict,
+                        s.join(" "),
+                        c.full.accepted,
+                        c.full.max_error_ms,
+                        c.full.confidence,
+                        c.full.ratio,
+                        c.full.splits,
+                        c.full.windows,
+                        c.full
+                            .disagreeing
+                            .iter()
+                            .map(|w| format!("{}s:{:+}ms/z{:.1}", w.start_ms / 1000, w.offset_ms, w.prominence))
+                            .collect::<Vec<_>>()
+                    );
+                }
             }
         }
         Cmd::Corpus { dir, repeats, reference, baselines, seed, data_dir, tuning } => {
