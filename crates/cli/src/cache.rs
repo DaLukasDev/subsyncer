@@ -67,6 +67,10 @@ const MIGRATIONS: &[&str] = &[
     // 2: the settings (and version) a scanned pair was processed with, so
     // low-confidence results are retried after they change.
     "ALTER TABLE scan_state ADD COLUMN settings TEXT NOT NULL DEFAULT '';",
+    // 3: how often a job was started without finishing (the process
+    // stopped), and an index for deleting old jobs.
+    "ALTER TABLE jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
+     CREATE INDEX jobs_finished ON jobs(finished_at);",
 ];
 
 fn migrate(conn: &mut Connection) -> Result<()> {
@@ -105,6 +109,8 @@ pub struct JobRow {
     pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
     pub result: Option<serde_json::Value>,
+    /// Times the job was started without finishing.
+    pub attempts: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -292,9 +298,83 @@ impl Cache {
         Ok(conn.last_insert_rowid())
     }
 
+    /// Mark a job running and count the attempt; finishing or re-queueing
+    /// it uncounts it again, so `attempts` counts runs the process didn't
+    /// survive.
     pub fn mark_job_running(&self, id: i64) -> Result<()> {
-        self.conn().execute("UPDATE jobs SET status='running', started_at=?2 WHERE id=?1", params![id, now_secs()])?;
+        self.conn().execute(
+            "UPDATE jobs SET status='running', started_at=?2, attempts=attempts+1 WHERE id=?1",
+            params![id, now_secs()],
+        )?;
         Ok(())
+    }
+
+    /// Put a running job back in the queue (interrupted by a shutdown).
+    pub fn requeue_job(&self, id: i64) -> Result<()> {
+        self.conn().execute(
+            "UPDATE jobs SET status='queued', started_at=NULL, attempts=MAX(attempts-1, 0)
+             WHERE id=?1 AND status='running'",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// Delete finished jobs that finished before `before` (unix seconds).
+    pub fn prune_jobs(&self, before: i64) -> Result<usize> {
+        Ok(self.conn().execute(
+            "DELETE FROM jobs WHERE status NOT IN ('queued','running') AND finished_at < ?1",
+            params![before],
+        )?)
+    }
+
+    /// Drop cache entries for files that are gone, and entries superseded by
+    /// a newer one for the same file and stream (an older VAD version, say).
+    /// If many files seem gone at once, the media is probably just not
+    /// mounted, and nothing is dropped for missing files.
+    pub fn prune_files(&self) -> Result<usize> {
+        const FILE_TABLES: [(&str, &str); 4] = [
+            ("timelines", "path"),
+            ("embedded_tracks", "path"),
+            ("embedded_checks", "path"),
+            ("scan_state", "subtitle"),
+        ];
+        let paths: Vec<String> = {
+            let conn = self.conn();
+            let sql = FILE_TABLES.map(|(t, c)| format!("SELECT {c} FROM {t}")).join(" UNION ");
+            let mut stmt = conn.prepare(&sql)?;
+            stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
+        };
+        // Checked without holding the database: this touches the disk.
+        let missing: Vec<&String> = paths.iter().filter(|p| !Path::new(p).exists()).collect();
+        let unmounted = missing.len() > 20 && missing.len() * 2 > paths.len();
+        if unmounted {
+            tracing::warn!(
+                missing = missing.len(),
+                of = paths.len(),
+                "most cached files are missing; is the media mounted?"
+            );
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let mut removed = 0;
+        if !unmounted {
+            for p in &missing {
+                for (t, c) in FILE_TABLES {
+                    removed += tx.execute(&format!("DELETE FROM {t} WHERE {c}=?1"), params![p])?;
+                }
+            }
+        }
+        for t in ["timelines", "embedded_tracks", "embedded_checks"] {
+            removed += tx.execute(
+                &format!(
+                    "DELETE FROM {t} WHERE rowid IN (SELECT rowid FROM (SELECT rowid, ROW_NUMBER() OVER
+                     (PARTITION BY path, stream ORDER BY created_at DESC, rowid DESC) AS n FROM {t}) WHERE n > 1)"
+                ),
+                [],
+            )?;
+        }
+        tx.commit()?;
+        Ok(removed)
     }
 
     pub fn finish_job(&self, id: i64, status: &str, result: &serde_json::Value) -> Result<()> {
@@ -318,6 +398,7 @@ impl Cache {
             started_at: r.get(7)?,
             finished_at: r.get(8)?,
             result: result.and_then(|s| serde_json::from_str(&s).ok()),
+            attempts: r.get(10)?,
         })
     }
 
@@ -325,7 +406,7 @@ impl Cache {
         Ok(self
             .conn()
             .query_row(
-                "SELECT id,video,subtitle,reference,dry_run,status,created_at,started_at,finished_at,result FROM jobs WHERE id=?1",
+                "SELECT id,video,subtitle,reference,dry_run,status,created_at,started_at,finished_at,result,attempts FROM jobs WHERE id=?1",
                 params![id],
                 Self::row_to_job,
             )
@@ -335,7 +416,7 @@ impl Cache {
     pub fn list_jobs(&self, limit: usize, status: Option<&str>) -> Result<Vec<JobRow>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id,video,subtitle,reference,dry_run,status,created_at,started_at,finished_at,result FROM jobs
+            "SELECT id,video,subtitle,reference,dry_run,status,created_at,started_at,finished_at,result,attempts FROM jobs
              WHERE (?1 IS NULL OR status=?1) ORDER BY id DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![status, limit as i64], Self::row_to_job)?;
@@ -346,7 +427,7 @@ impl Cache {
     pub fn unfinished_jobs(&self) -> Result<Vec<JobRow>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id,video,subtitle,reference,dry_run,status,created_at,started_at,finished_at,result FROM jobs
+            "SELECT id,video,subtitle,reference,dry_run,status,created_at,started_at,finished_at,result,attempts FROM jobs
              WHERE status IN ('queued','running') ORDER BY id",
         )?;
         let rows = stmt.query_map([], Self::row_to_job)?;
@@ -447,6 +528,11 @@ mod tests {
         let id = cache.insert_job("/v.mkv", "/v.srt", "auto", false).unwrap();
         assert_eq!(cache.unfinished_jobs().unwrap().len(), 1);
         cache.mark_job_running(id).unwrap();
+        cache.requeue_job(id).unwrap();
+        let j = cache.get_job(id).unwrap().unwrap();
+        assert_eq!((j.status.as_str(), j.attempts), ("queued", 0));
+        cache.mark_job_running(id).unwrap();
+        assert_eq!(cache.get_job(id).unwrap().unwrap().attempts, 1);
         cache.finish_job(id, "synced", &serde_json::json!({"offset_ms": 5})).unwrap();
         let j = cache.get_job(id).unwrap().unwrap();
         assert_eq!(j.status, "synced");
@@ -454,5 +540,30 @@ mod tests {
         assert!(cache.unfinished_jobs().unwrap().is_empty());
         assert_eq!(cache.list_jobs(10, None).unwrap().len(), 1);
         assert_eq!(cache.list_jobs(10, Some("failed")).unwrap().len(), 0);
+        assert_eq!(cache.prune_jobs(now_secs() - 60).unwrap(), 0, "finished just now");
+        assert_eq!(cache.prune_jobs(now_secs() + 60).unwrap(), 1);
+        assert!(cache.get_job(id).unwrap().is_none());
+    }
+
+    #[test]
+    fn pruning_drops_gone_and_superseded_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(&dir.path().join("data")).unwrap();
+        let tl = Timeline::from_intervals([Interval::new(100, 900)], Some(200));
+        let here = dir.path().join("here.mkv");
+        std::fs::write(&here, b"").unwrap();
+        let key = |p: &Path| FileKey { path: p.to_string_lossy().into_owned(), size: 1, mtime_ns: 1 };
+        cache.put_timeline(&key(&here), 1, "old", &tl).unwrap();
+        // Same second, so the rowid decides which is newer.
+        cache.put_timeline(&key(&here), 1, "new", &tl).unwrap();
+        cache.put_timeline(&key(&dir.path().join("gone.mkv")), 1, "new", &tl).unwrap();
+        assert_eq!(cache.prune_files().unwrap(), 2);
+        assert!(cache.get_timeline(&key(&here), 1, "new").unwrap().is_some());
+        assert!(cache.get_timeline(&key(&here), 1, "old").unwrap().is_none());
+        // Many files missing at once: the media is probably not mounted.
+        for k in 0..30 {
+            cache.put_timeline(&key(&dir.path().join(format!("unmounted{k}.mkv"))), 1, "new", &tl).unwrap();
+        }
+        assert_eq!(cache.prune_files().unwrap(), 0);
     }
 }
