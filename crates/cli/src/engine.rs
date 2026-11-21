@@ -278,6 +278,9 @@ impl Engine {
         let v = &result.verdict;
         report.outcome = Some(v.outcome);
         report.reason = v.reason.clone();
+        if let Some(hint) = search_edge_hint(v, self.settings.align.max_offset_ms) {
+            report.reason.push_str(&hint);
+        }
         report.offset_ms = v.offset_ms;
         report.ratio = v.ratio;
         report.splits = v.splits;
@@ -656,6 +659,24 @@ impl Engine {
     }
 }
 
+/// A low-confidence best offset this close to the end of the search range
+/// suggests the real offset lies beyond it.
+const EDGE_MS: i64 = 2_000;
+
+/// For a low-confidence result whose best offset is at the edge of the
+/// search range: a hint to search further.
+fn search_edge_hint(v: &subsyncer_core::Verdict, max_offset_ms: i64) -> Option<String> {
+    (v.outcome == Outcome::LowConfidence && max_offset_ms > 0 && max_offset_ms - v.offset_ms.abs() <= EDGE_MS).then(
+        || {
+            format!(
+                "; the best match is at the edge of the ±{} s search range, so the subtitle may be off by more \
+                 (try a larger SUBSYNCER_MAX_OFFSET_SECS)",
+                max_offset_ms / 1000
+            )
+        },
+    )
+}
+
 /// Cache version of a speech timeline: VAD settings plus the audio filter.
 fn timeline_version(filter: Option<&str>) -> String {
     format!("{}|{}", vad::VAD_VERSION, filter.unwrap_or("downmix"))
@@ -730,6 +751,26 @@ pub fn write_atomic(target: &Path, bytes: &[u8], backup: bool) -> Result<Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hint_at_the_edge_of_the_search_range() {
+        let v = |outcome, offset_ms| subsyncer_core::Verdict {
+            outcome,
+            offset_ms,
+            ratio: 1.0,
+            splits: 0,
+            score_before: 0.2,
+            score_after: 0.2,
+            prominence: 3.0,
+            max_shift_ms: offset_ms.abs(),
+            hidden_cues: 0,
+            reason: String::new(),
+        };
+        assert!(search_edge_hint(&v(Outcome::LowConfidence, -59_200), 60_000).unwrap().contains("±60 s"));
+        assert!(search_edge_hint(&v(Outcome::LowConfidence, 60_000), 60_000).is_some());
+        assert!(search_edge_hint(&v(Outcome::LowConfidence, 40_000), 60_000).is_none());
+        assert!(search_edge_hint(&v(Outcome::Synced, 59_900), 60_000).is_none());
+    }
 
     #[test]
     fn atomic_write_with_backup() {
