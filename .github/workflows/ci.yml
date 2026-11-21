@@ -4,13 +4,23 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The Docker and Release workflows run this first and only build if it
+  # passes.
+  workflow_call:
+    inputs:
+      skip-reports:
+        description: Skip the evaluation reports
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 # New pushes to a pull request cancel its older runs; main runs always finish.
+# Called from another workflow, `github.workflow` is the caller's name, so its
+# runs don't queue behind (or cancel) the ones started by the same push here.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -25,6 +35,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # For the tests that run real ffmpeg (they are skipped without it).
+      - name: Install FFmpeg
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
@@ -32,6 +45,7 @@ jobs:
       - name: Tests (includes the synthetic eval suite)
         run: cargo test --workspace --locked
       - name: Synthetic evaluation report
+        if: ${{ !inputs.skip-reports }}
         run: |
           cargo run --release --locked -p subsyncer-eval -- synthetic --seeds 30 --compare | tee eval.txt
           {
@@ -41,8 +55,42 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Embedded-track check report
+        if: ${{ !inputs.skip-reports }}
         run: |
           {
             echo '## Embedded-track check (synthetic)'
             cargo run --release --locked -p subsyncer-eval -- embedded --seeds 60
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # The oldest Rust the crates claim to support (rust-version in Cargo.toml).
+  msrv:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - id: msrv
+        run: echo "version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets --locked
+
+  # Pull requests build the image too, so a broken Dockerfile shows up before
+  # it's merged (pushes to main build it in the Docker workflow).
+  docker:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: subsyncer:ci
+          cache-from: type=gha,scope=linux-amd64
+      - name: Smoke test
+        run: |
+          docker run --rm subsyncer:ci --version
+          docker run --rm --entrypoint ffprobe subsyncer:ci -version
