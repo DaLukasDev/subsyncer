@@ -36,18 +36,32 @@ finding the shift (or set of shifts) that makes them line up.
    curve, so slow changes in dialogue density don't hide a sharp true peak.
 5. **Piecewise alignment.** A dynamic program over (cue, offset): each cue scores
    +1 per speech frame and −λ per non-speech frame (O(1) via prefix sums), and
-   starting a new segment costs `SPLIT_PENALTY`.
+   starting a new segment costs `SPLIT_PENALTY` (2000).
    - A backward jump larger than the dialogue gap at that point also pays for
      the overlap it creates, because real cuts sit in gaps.
    - The offset range covers every strong correlation peak and widens if a
      segment lands on its edge.
-   - Ratio 1 and the best other ratio both go through the DP, and its objective
-     decides between them. Inserted chunks build up offset like a framerate
-     drift does, so the global correlation alone can't tell them apart.
+   - **Small steps get a second search.** When the act breaks of the
+     subtitle's source and the video differ in length, the offset changes by
+     a second or so a few times. In dense dialogue such a step gains less
+     than the split penalty. So the DP runs again with every cue kept within
+     ±3 s of the first result, where a split costs 700: a search that narrow
+     fits noise far less easily than one spanning minutes.
    - Short or near-identical segments are merged.
    - **Each segment must have its own sharp correlation peak**, otherwise it is
      merged into a neighbour. Without this, a subtitle for a different video
      gets "fitted" with several spurious segments.
+   - **A small step must show on both sides of it**: each side's cues must
+     line up clearly better at their own offset than at the other side's (by
+     2 on the detrended z-score). Peak prominence alone can't tell, since the
+     two offsets are too close to count as separate peaks.
+   - If nearly every segment of the first search fails these checks, it
+     fitted noise all over: it is repeated with a doubled penalty.
+   - Ratio 1 and the best other ratio both go through all of this, and the
+     objective (fit minus split costs) decides between them; another ratio
+     must win by 0.0025 per cue frame. Inserted chunks build up offset like a
+     framerate drift does, and a few small steps can look like a slow drift,
+     so the global correlation alone can't tell them apart.
    - Overlaps from removed content are collapsed so cues stay in order: the
      side the video lacks is hidden (its cues become zero length), together
      with the sound descriptions and other cues in that part. Cues moved
@@ -55,9 +69,9 @@ finding the shift (or set of shifts) that makes them line up.
 6. **Quality gate.**
    - `already_synced`: nothing moves by 100 ms or more, or a correction of at
      most 300 ms gives no measurable gain.
-   - `low_confidence`: the peak isn't prominent enough, the result would hide
-     more than a quarter of the lines, or the speech overlap doesn't improve
-     enough. Nothing is written. When the best match sits at the edge of the
+   - `low_confidence`: the peak isn't prominent enough (for a split result,
+     the weakest segment's own peak), the result would hide more than a
+     quarter of the lines, or the speech overlap doesn't improve enough. Nothing is written. When the best match sits at the edge of the
      search range, the reason suggests a larger `SUBSYNCER_MAX_OFFSET_SECS`.
    - `synced`: written.
    - `failed`: an error, e.g. no audio stream or an unparsable file.

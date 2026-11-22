@@ -70,8 +70,23 @@ Responses:
 `status` is `queued`, `running`, `done` or `cancelled`. `outcome` is one of
 `synced`, `already_synced`, `low_confidence` or `failed`.
 
+`prominence` is the confidence: how clearly the correlation peak stands out.
+For a split result it is that of the weakest segment on its own, which is
+lower than a whole file's would be, so it doesn't compare between results
+with and without splits.
+
 `result.hidden_cues` counts the lines the result hides because the video
 doesn't have that part (for example a scene missing from this cut).
+
+`result.stretches` shows, for a `synced` or `low_confidence` result, where
+each two-minute stretch of it lines up with the speech on its own:
+`{"start_ms": 2149508, "cues": 37, "offset_ms": 800, "prominence": 7.2,
+"support": 6.2}`. `start_ms` is video time, and `offset_ms` is how far that
+stretch would have to move: 0 means the result is right there. Single
+stretches are noisy, so a few hundred ms here and there means little. A
+stretch that lines up clearly elsewhere (`prominence` 6 or more and over
+400 ms away) points at a part of the result that is off; `subsyncer sync`
+prints those.
 
 When the video has a usable embedded subtitle track, `result.embedded_check`
 says how it was checked against the audio:
@@ -93,7 +108,14 @@ Cancel a job.
 
 ## `GET /jobs?limit=50&status=done`
 
-Recent jobs, newest first: `{"jobs": [...]}`.
+Recent jobs, newest first: `{"jobs": [...], "next_before_id": 1275}`.
+
+- `limit`: up to 1000 (default 50).
+- `status`: only jobs with this status.
+- `path`: only jobs whose video or subtitle path contains this text, as
+  subsyncer saw the path (after `SUBSYNCER_PATH_MAP`).
+- `before_id`: only jobs older than this one. When a page is full,
+  `next_before_id` is the value for the next page; otherwise it is `null`.
 
 ## `GET /healthz`
 

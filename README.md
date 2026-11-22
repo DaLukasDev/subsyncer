@@ -18,6 +18,8 @@ It handles:
   drift further off as the episode goes on;
 - videos with an **extra ad break, recap or a different cut**, where only part
   of the subtitle is off;
+- subtitles from a release whose **act breaks have other lengths**, so the
+  offset changes by a second or so a few times during the episode;
 - **SRT, ASS/SSA and WebVTT** in any text encoding. Only timestamps change;
   styling and text stay exactly as they were.
 
