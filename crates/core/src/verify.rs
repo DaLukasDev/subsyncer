@@ -297,31 +297,10 @@ pub struct FullCheck {
 pub fn check_full(audio: &Timeline, track: &[Interval], align_cfg: &AlignConfig, cfg: &CheckConfig) -> FullCheck {
     let a = align::align(audio, track, align_cfg);
     let max_error_ms = a.segments.iter().map(|s| (s.offset_ms - cfg.expected_lag_ms).abs()).max().unwrap_or(0);
-    let mut windows = 0;
-    let mut disagreeing = Vec::new();
-    let mut scan = Vec::new();
-    let first = track.iter().map(|c| c.start_ms).min();
-    let last = track.iter().map(|c| c.start_ms).max();
-    if let (Some(first), Some(last)) = (first, last)
-        && audio.active_fraction() >= 0.005
-        && cfg.window_ms > 0
-    {
-        // Laid out backwards from the last cue, so the final window covers
-        // the end of the track in full.
-        let mut start = last + 1 - cfg.window_ms;
-        while start + cfg.window_ms > first {
-            let c = window_check(audio, 0, track, start, cfg.window_ms, cfg.scan_range_ms, cfg);
-            if c.cues >= cfg.min_cues {
-                windows += 1;
-                if c.prominence >= cfg.scan_min_prominence && !in_sync(&c, cfg) {
-                    disagreeing.push(c);
-                }
-                scan.push(c);
-            }
-            start -= cfg.window_ms;
-        }
-        scan.reverse();
-    }
+    let scan = scan(audio, track, cfg);
+    let windows = scan.len();
+    let mut disagreeing: Vec<SampleCheck> = scan.iter().copied().filter(|c| lines_up_elsewhere(c, cfg)).collect();
+    disagreeing.reverse();
     let (mut run, mut unsupported_run, mut unsupported_cues) = (0, 0, 0);
     for c in &scan {
         if c.support < cfg.scan_min_support {
@@ -359,6 +338,36 @@ pub fn check_full(audio: &Timeline, track: &[Interval], align_cfg: &AlignConfig,
         end_supported,
         scan,
     }
+}
+
+/// Each `window_ms` stretch of `cues` checked on its own against `audio`,
+/// over ±`scan_range_ms`, in time order. The windows are laid out backwards
+/// from the last cue, so the final one covers the end in full; windows with
+/// fewer than `min_cues` cues are left out.
+pub fn scan(audio: &Timeline, cues: &[Interval], cfg: &CheckConfig) -> Vec<SampleCheck> {
+    let mut out = Vec::new();
+    let first = cues.iter().map(|c| c.start_ms).min();
+    let last = cues.iter().map(|c| c.start_ms).max();
+    if let (Some(first), Some(last)) = (first, last)
+        && audio.active_fraction() >= 0.005
+        && cfg.window_ms > 0
+    {
+        let mut start = last + 1 - cfg.window_ms;
+        while start + cfg.window_ms > first {
+            let c = window_check(audio, 0, cues, start, cfg.window_ms, cfg.scan_range_ms, cfg);
+            if c.cues >= cfg.min_cues {
+                out.push(c);
+            }
+            start -= cfg.window_ms;
+        }
+        out.reverse();
+    }
+    out
+}
+
+/// Whether a window clearly lines up at another offset than the in-sync one.
+pub fn lines_up_elsewhere(c: &SampleCheck, cfg: &CheckConfig) -> bool {
+    c.prominence >= cfg.scan_min_prominence && !in_sync(c, cfg)
 }
 
 /// A region of the track that one segment of a split result relies on,
@@ -617,6 +626,35 @@ mod tests {
         assert!(check(&truth, 0, 0, cut).supported);
         assert!(check(&truth, 1, cut, len).supported);
         assert_eq!(region_alternatives(&[0, -20_000, 0], 1), vec![20_000]);
+    }
+
+    #[test]
+    fn scan_finds_a_stretch_that_lines_up_elsewhere() {
+        let len = 30 * 60_000;
+        let truth = cues(len, 6);
+        let audio = Timeline::from_intervals(truth.iter().copied(), Some((len / FRAME_MS) as usize));
+        let cfg = CheckConfig { expected_lag_ms: 0, ..CheckConfig::default() };
+        let scan = scan(&audio, &truth, &cfg);
+        assert!(scan.len() >= 12, "{} windows", scan.len());
+        assert!(scan.iter().all(|w| !lines_up_elsewhere(w, &cfg)), "{scan:?}");
+        // Minutes 10 to 14 are 3 s early.
+        let off: Vec<Interval> = truth
+            .iter()
+            .map(|c| {
+                if (600_000..840_000).contains(&c.start_ms) {
+                    Interval::new(c.start_ms - 3_000, c.end_ms - 3_000)
+                } else {
+                    *c
+                }
+            })
+            .collect();
+        let bad: Vec<SampleCheck> = scan_windows_off(&audio, &off, &cfg);
+        assert!(!bad.is_empty() && bad.iter().all(|w| (w.offset_ms - 3_000).abs() <= 50), "{bad:?}");
+        assert!(bad.iter().all(|w| w.start_ms > 540_000 && w.start_ms < 840_000), "{bad:?}");
+    }
+
+    fn scan_windows_off(audio: &Timeline, cues: &[Interval], cfg: &CheckConfig) -> Vec<SampleCheck> {
+        scan(audio, cues, cfg).into_iter().filter(|w| lines_up_elsewhere(w, cfg)).collect()
     }
 
     #[test]
