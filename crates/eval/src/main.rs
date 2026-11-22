@@ -46,6 +46,14 @@ struct Tuning {
     window_secs: Option<f64>,
     #[arg(long)]
     min_segment_cues: Option<usize>,
+    #[arg(long)]
+    piecewise_ratio_margin: Option<f64>,
+    #[arg(long)]
+    refine_penalty: Option<f64>,
+    #[arg(long)]
+    refine_range_secs: Option<f64>,
+    #[arg(long)]
+    min_step_support: Option<f64>,
     /// Print per-case results as JSON lines instead of the table.
     #[arg(long)]
     json: bool,
@@ -147,6 +155,18 @@ fn configs(t: &Tuning) -> (AlignConfig, GateConfig) {
     }
     if let Some(v) = t.min_segment_cues {
         a.min_segment_cues = v;
+    }
+    if let Some(v) = t.piecewise_ratio_margin {
+        a.piecewise_ratio_margin = v;
+    }
+    if let Some(v) = t.refine_penalty {
+        a.refine_split_penalty = v;
+    }
+    if let Some(v) = t.refine_range_secs {
+        a.refine_range_ms = (v * 1000.0) as i64;
+    }
+    if let Some(v) = t.min_step_support {
+        a.min_step_support = v;
     }
     if let Some(v) = t.min_confidence {
         g.min_confidence = v;

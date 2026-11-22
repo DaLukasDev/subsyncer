@@ -138,3 +138,81 @@ fn overlap_score_basics() {
     assert_eq!(overlap_score(&reference, &[Interval::new(1500, 2500)]), 0.5);
     assert_eq!(overlap_score(&reference, &[Interval::new(3000, 4000)]), 0.0);
 }
+
+/// `truth` with the offset changing in steps: from each `(at_ms, shift_ms)`
+/// on, the subtitle is `shift_ms` early (the alignment must add it).
+fn stepped(truth: &[Interval], steps: &[(i64, i64)]) -> Vec<Interval> {
+    truth
+        .iter()
+        .map(|c| {
+            let d = steps.iter().rev().find(|s| c.start_ms >= s.0).map_or(0, |s| s.1);
+            Interval::new(c.start_ms - d, c.end_ms - d)
+        })
+        .collect()
+}
+
+fn within(a: &Alignment, truth: &[Interval], tol_ms: i64) -> f64 {
+    let ok = a.cues.iter().zip(truth).filter(|(x, y)| (x.start_ms - y.start_ms).abs() <= tol_ms).count();
+    ok as f64 / truth.len() as f64
+}
+
+#[test]
+fn small_steps_are_found() {
+    // Act breaks of other lengths than the subtitle's source: the offset
+    // changes by about a second a few times. Steps this small cost too much
+    // for the main split search on their own.
+    let (reference, truth) = synth(42 * 60_000, 21);
+    let subs = stepped(&truth, &[(0, 100), (6 * 60_000, 1_100), (21 * 60_000, 1_500), (33 * 60_000, 900)]);
+    let a = align(&reference, &subs, &AlignConfig::default());
+    assert_eq!(a.mapping.ratio, 1.0);
+    assert!(a.splits() >= 3, "segments {:?}", a.segments);
+    assert!(within(&a, &truth, 200) >= 0.98, "{:.3}, segments {:?}", within(&a, &truth, 200), a.segments);
+}
+
+#[test]
+fn a_slow_drift_stays_a_drift() {
+    // Timed for 24 fps, played at 23.976: about 2.5 s of drift over 42
+    // minutes, which a few small steps could imitate.
+    let (reference, truth) = synth(42 * 60_000, 23);
+    let r = 24.0 / 23.976;
+    let subs: Vec<Interval> =
+        truth.iter().map(|c| Interval::new(scale(c.start_ms, r) - 400, scale(c.end_ms, r) - 400)).collect();
+    let a = align(&reference, &subs, &AlignConfig::default());
+    assert!((a.mapping.ratio - 23.976 / 24.0).abs() < 1e-9, "ratio {}", a.mapping.ratio);
+    assert_eq!(a.splits(), 0, "segments {:?}", a.segments);
+    assert!(within(&a, &truth, 30) >= 0.99);
+}
+
+#[test]
+fn a_small_step_needs_both_sides() {
+    let (reference, truth) = synth(30 * 60_000, 5);
+    let rs = RefScore::new(&reference, 1.0);
+    let cfg = AlignConfig::default();
+    let mid = truth.len() / 2;
+    let split = |off: i64| {
+        vec![
+            Segment { first_cue: 0, last_cue: mid - 1, offset_ms: 0 },
+            Segment { first_cue: mid, last_cue: truth.len() - 1, offset_ms: off },
+        ]
+    };
+    // A step the cues don't show: merged.
+    let (segs, _) = check_segments(&reference, &rs, &truth, split(600), &cfg);
+    assert_eq!(segs.len(), 1, "{segs:?}");
+    assert!(segs[0].offset_ms.abs() <= 100, "{segs:?}");
+    // A real one stays.
+    let subs = stepped(&truth, &[(truth[mid].start_ms, 600)]);
+    let (segs, _) = check_segments(&reference, &rs, &subs, split(600), &cfg);
+    assert_eq!(segs, split(600));
+}
+
+#[test]
+fn a_low_split_penalty_keeps_the_splits() {
+    // A lower penalty must not end up with fewer splits than the default:
+    // when the search fits noise all over, it is repeated with a higher one.
+    let (reference, truth) = synth(42 * 60_000, 21);
+    let subs = stepped(&truth, &[(0, 100), (6 * 60_000, 1_100), (21 * 60_000, 1_500), (33 * 60_000, 900)]);
+    for split_penalty in [100.0, 500.0] {
+        let a = align(&reference, &subs, &AlignConfig { split_penalty, ..AlignConfig::default() });
+        assert!(within(&a, &truth, 200) >= 0.98, "penalty {split_penalty}: segments {:?}", a.segments);
+    }
+}
