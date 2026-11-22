@@ -69,3 +69,32 @@ fn hard_noise_never_breaks_synced_input() {
         }
     }
 }
+
+#[test]
+fn small_steps_and_slow_drifts() {
+    let results =
+        run_synthetic(&opts(&Kind::DRIFTS, NoiseModel::default()), &AlignConfig::default(), &GateConfig::default());
+    let rows = summarize("piecewise", &results);
+    println!("{}", table(&rows));
+    let get = |k: Kind| rows.iter().find(|r| r.kind == k.name()).unwrap();
+    // Act breaks of other lengths: the offset changes by 0.4-1.5 s a few times.
+    assert!(get(Kind::Steps).within >= 0.96, "steps {:.3}", get(Kind::Steps).within);
+    // A 0.1 % framerate drift looks much the same, and is still fixed as one.
+    assert!(get(Kind::SlowDrift).within >= 0.98, "slow_drift {:.3}", get(Kind::SlowDrift).within);
+    assert!(results.iter().filter(|r| r.kind == Kind::SlowDrift).all(|r| r.splits == 0));
+}
+
+#[test]
+fn a_low_split_penalty_does_no_harm() {
+    // A search that fits noise all over is repeated with a higher penalty,
+    // rather than merged down to a single offset.
+    let cfg = AlignConfig { split_penalty: 100.0, ..AlignConfig::default() };
+    let kinds = [Kind::Offset, Kind::InsertChunk, Kind::Steps];
+    let results = run_synthetic(&opts(&kinds, NoiseModel::default()), &cfg, &GateConfig::default());
+    let rows = summarize("piecewise", &results);
+    println!("{}", table(&rows));
+    let get = |k: Kind| rows.iter().find(|r| r.kind == k.name()).unwrap();
+    assert_eq!(get(Kind::Offset).mean_splits, 0.0);
+    assert!(get(Kind::InsertChunk).within >= 0.98, "insert_chunk {:.3}", get(Kind::InsertChunk).within);
+    assert!(get(Kind::Steps).within >= 0.9, "steps {:.3}", get(Kind::Steps).within);
+}

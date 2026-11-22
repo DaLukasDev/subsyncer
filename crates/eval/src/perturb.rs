@@ -31,6 +31,13 @@ pub enum Kind {
     /// `ALL`: used by the embedded-track check, where the end of the file is
     /// the hardest part to cover with samples.
     LateInsert,
+    /// The offset changes in a few steps of 0.4-1.5 s, either way, at long
+    /// gaps: the subtitle was timed for a version whose act breaks have
+    /// other lengths.
+    Steps,
+    /// The subtle framerate mismatch (24 vs 23.976 fps): a drift of about
+    /// 2.5 s over 40 minutes, which a few steps could imitate.
+    SlowDrift,
 }
 
 impl Kind {
@@ -47,6 +54,9 @@ impl Kind {
     ];
     /// Extra kinds, not run by default.
     pub const EXTRA: [Kind; 1] = [Kind::LateInsert];
+    /// Offsets that change in small steps or gradually, which can look
+    /// alike. Not run by default.
+    pub const DRIFTS: [Kind; 2] = [Kind::Steps, Kind::SlowDrift];
 
     pub fn name(&self) -> &'static str {
         match self {
@@ -60,10 +70,12 @@ impl Kind {
             Kind::FramerateInsert => "framerate_insert",
             Kind::WrongVideo => "wrong_video",
             Kind::LateInsert => "late_insert",
+            Kind::Steps => "steps",
+            Kind::SlowDrift => "slow_drift",
         }
     }
     pub fn parse(s: &str) -> Option<Kind> {
-        Kind::ALL.iter().chain(&Kind::EXTRA).copied().find(|k| k.name() == s)
+        Kind::ALL.iter().chain(&Kind::EXTRA).chain(&Kind::DRIFTS).copied().find(|k| k.name() == s)
     }
 }
 
@@ -132,6 +144,38 @@ pub fn perturb(kind: Kind, truth: &[Interval], len_ms: i64, rng: &mut Rng) -> Pe
             let p = chunk_point(rng, &base, len_ms / 5, len_ms * 4 / 5);
             (format!("subtitle +{t} ms at {p} ms"), remove_chunk(base, p, t, rng))
         }
+        Kind::Steps => {
+            let n = rng.range(2, 5);
+            let d0 = rng.range(-1_000, 1_000);
+            let mut v = shift_all(base, -d0);
+            let mut desc = format!("offset {d0} ms");
+            let mut total = d0;
+            for k in 0..n {
+                // One step per equal part of the middle 80 %, at its longest gap.
+                let part = len_ms * 8 / 10 / n;
+                let lo = len_ms / 10 + k * part + part / 4;
+                let p = longest_gap(&v, lo, lo + part / 2);
+                let step = sign(rng) * rng.range(400, 1_500);
+                total += step;
+                desc.push_str(&format!(", {total} ms from {p} ms"));
+                v =
+                    v.into_iter()
+                        .map(|(c, t)| {
+                            if c.start_ms >= p {
+                                (Interval::new(c.start_ms - step, c.end_ms - step), t)
+                            } else {
+                                (c, t)
+                            }
+                        })
+                        .collect();
+            }
+            (desc, v)
+        }
+        Kind::SlowDrift => {
+            let r = if rng.chance(0.5) { 24.0 / 23.976 } else { 23.976 / 24.0 };
+            let d = rng.range(-1_000, 1_000);
+            (format!("ratio {r:.5}, offset {d} ms"), scale_all(base, r, -d))
+        }
         Kind::FramerateInsert => {
             let r = DEFAULT_RATIOS[rng.range(1, DEFAULT_RATIOS.len() as i64) as usize];
             let t = rng.range(5_000, 40_000);
@@ -144,6 +188,24 @@ pub fn perturb(kind: Kind, truth: &[Interval], len_ms: i64, rng: &mut Rng) -> Pe
     out.retain(|(c, _)| c.end_ms > 0);
     out.sort_by_key(|(c, _)| (c.start_ms, c.end_ms));
     Perturbed { kind, desc, cues: out.iter().map(|x| x.0).collect(), truth: out.iter().map(|x| x.1).collect() }
+}
+
+/// The middle of the longest gap between cues starting in [lo, hi), as the
+/// start of the cue after it (where a step takes effect).
+fn longest_gap(cues: &[(Interval, Option<Interval>)], lo: i64, hi: i64) -> i64 {
+    let mut best = (i64::MIN, lo);
+    let mut prev_end: Option<i64> = None;
+    for (c, _) in cues {
+        if let Some(e) = prev_end
+            && c.start_ms >= lo
+            && c.start_ms < hi
+            && c.start_ms - e > best.0
+        {
+            best = (c.start_ms - e, c.start_ms);
+        }
+        prev_end = Some(prev_end.map_or(c.end_ms, |e| e.max(c.end_ms)));
+    }
+    best.1
 }
 
 fn shift_all(v: Vec<(Interval, Option<Interval>)>, d: i64) -> Vec<(Interval, Option<Interval>)> {
