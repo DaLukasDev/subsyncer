@@ -36,6 +36,15 @@ impl FileKey {
     }
 }
 
+/// Which jobs to list (see [`Cache::list_jobs`]).
+#[derive(Clone, Debug, Default)]
+pub struct JobQuery {
+    pub limit: usize,
+    pub status: Option<String>,
+    pub before_id: Option<i64>,
+    pub path: Option<String>,
+}
+
 /// Schema changes after the original tables, applied in order.
 /// `PRAGMA user_version` records how many have been applied. Older versions
 /// of subsyncer keep working with an upgraded database: they only add
@@ -413,13 +422,18 @@ impl Cache {
             .optional()?)
     }
 
-    pub fn list_jobs(&self, limit: usize, status: Option<&str>) -> Result<Vec<JobRow>> {
+    /// Jobs newest first, optionally only those with `status`, with an id
+    /// below `before_id` (the next page), or whose video or subtitle path
+    /// contains `path`.
+    pub fn list_jobs(&self, q: &JobQuery) -> Result<Vec<JobRow>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT id,video,subtitle,reference,dry_run,status,created_at,started_at,finished_at,result,attempts FROM jobs
-             WHERE (?1 IS NULL OR status=?1) ORDER BY id DESC LIMIT ?2",
+             WHERE (?1 IS NULL OR status=?1) AND (?3 IS NULL OR id < ?3)
+               AND (?4 IS NULL OR instr(video, ?4) > 0 OR instr(subtitle, ?4) > 0)
+             ORDER BY id DESC LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![status, limit as i64], Self::row_to_job)?;
+        let rows = stmt.query_map(params![q.status, q.limit as i64, q.before_id, q.path], Self::row_to_job)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -538,8 +552,9 @@ mod tests {
         assert_eq!(j.status, "synced");
         assert_eq!(j.result.unwrap()["offset_ms"], 5);
         assert!(cache.unfinished_jobs().unwrap().is_empty());
-        assert_eq!(cache.list_jobs(10, None).unwrap().len(), 1);
-        assert_eq!(cache.list_jobs(10, Some("failed")).unwrap().len(), 0);
+        let q = |status: Option<&str>| JobQuery { limit: 10, status: status.map(String::from), ..Default::default() };
+        assert_eq!(cache.list_jobs(&q(None)).unwrap().len(), 1);
+        assert_eq!(cache.list_jobs(&q(Some("failed"))).unwrap().len(), 0);
         assert_eq!(cache.prune_jobs(now_secs() - 60).unwrap(), 0, "finished just now");
         assert_eq!(cache.prune_jobs(now_secs() + 60).unwrap(), 1);
         assert!(cache.get_job(id).unwrap().is_none());

@@ -312,3 +312,28 @@ fn allowed_dirs_are_normalized() {
         PathBuf::from("/media/movies/a.mkv")
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn jobs_can_be_paged_and_filtered() {
+    // No workers are started, so the jobs stay queued.
+    let f = fixture("exit 1", |_, _| {});
+    let mut ids = Vec::new();
+    for name in ["a", "b", "c", "d", "e"] {
+        let (video, sub) = f.media(name);
+        ids.push(f.post(&video, &sub, &[]).await);
+    }
+    let page = |v: &Value| v["jobs"].as_array().unwrap().iter().map(|j| j["id"].as_i64().unwrap()).collect::<Vec<_>>();
+    let (_, v) = f.json("GET", "/jobs?limit=2", None, None).await;
+    assert_eq!(page(&v), vec![ids[4], ids[3]]);
+    assert_eq!(v["next_before_id"].as_i64(), Some(ids[3]));
+    let (_, v) = f.json("GET", &format!("/jobs?limit=2&before_id={}", ids[3]), None, None).await;
+    assert_eq!(page(&v), vec![ids[2], ids[1]]);
+    let (_, v) = f.json("GET", &format!("/jobs?limit=2&before_id={}", ids[1]), None, None).await;
+    assert_eq!(page(&v), vec![ids[0]]);
+    assert!(v["next_before_id"].is_null(), "{v}");
+    // A part of the video or subtitle path.
+    let (_, v) = f.json("GET", "/jobs?path=c.en.srt", None, None).await;
+    assert_eq!(page(&v), vec![ids[2]]);
+    let (_, v) = f.json("GET", "/jobs?path=media%2Fd.mkv&status=queued", None, None).await;
+    assert_eq!(page(&v), vec![ids[3]]);
+}

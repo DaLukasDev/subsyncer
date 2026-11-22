@@ -28,7 +28,7 @@ use serde_json::{Value, json};
 use subsyncer_core::Outcome;
 use tracing::{error, info, warn};
 
-use crate::cache::{Cache, JobRow, now_secs};
+use crate::cache::{Cache, JobQuery, JobRow, now_secs};
 use crate::config::PathMap;
 use crate::engine::{Engine, ReferenceMode, SyncRequest};
 use crate::scan::SUB_EXTS;
@@ -588,12 +588,24 @@ async fn delete_job(State(app): State<Arc<App>>, UrlPath(id): UrlPath<i64>) -> R
 struct ListQuery {
     limit: Option<usize>,
     status: Option<String>,
+    before_id: Option<i64>,
+    path: Option<String>,
 }
 
 async fn list_jobs(State(app): State<Arc<App>>, Query(q): Query<ListQuery>) -> Response {
-    let limit = q.limit.unwrap_or(50).clamp(1, 1000);
-    blocking(move || match app.cache.list_jobs(limit, q.status.as_deref()) {
-        Ok(rows) => Json(json!({ "jobs": rows.iter().map(job_json).collect::<Vec<_>>() })).into_response(),
+    let query = JobQuery {
+        limit: q.limit.unwrap_or(50).clamp(1, 1000),
+        status: q.status.filter(|s| !s.is_empty()),
+        before_id: q.before_id,
+        path: q.path.filter(|p| !p.is_empty()),
+    };
+    blocking(move || match app.cache.list_jobs(&query) {
+        Ok(rows) => {
+            // A full page may have more after it.
+            let next = (rows.len() == query.limit).then(|| rows.last().map(|r| r.id)).flatten();
+            Json(json!({ "jobs": rows.iter().map(job_json).collect::<Vec<_>>(), "next_before_id": next }))
+                .into_response()
+        }
         Err(e) => db_error(e),
     })
     .await
