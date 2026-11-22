@@ -224,6 +224,7 @@ fn run_baseline(b: Baseline, video: &Path, p: &Perturbed, tmp: &Path, source: &s
         prominence: 0.0,
         score_before: 0.0,
         score_after: 0.0,
+        stretches_off: 0,
         elapsed_ms: elapsed.min(Duration::from_secs(86_400)).as_millis() as u64,
     })
 }

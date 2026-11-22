@@ -3,6 +3,7 @@
 
 pub mod corpus;
 pub mod embedded;
+pub mod library;
 pub mod perturb;
 pub mod report;
 pub mod synth;
@@ -10,6 +11,7 @@ pub mod synth;
 use subsyncer_core::align::{self, AlignConfig};
 use subsyncer_core::gate::{self, GateConfig, Outcome};
 use subsyncer_core::timeline::{Interval, Timeline};
+use subsyncer_core::verify::{self, CheckConfig};
 
 use perturb::{Kind, Perturbed};
 
@@ -38,6 +40,8 @@ pub struct CaseResult {
     pub prominence: f64,
     pub score_before: f64,
     pub score_after: f64,
+    /// Two-minute stretches of the result that clearly line up elsewhere.
+    pub stretches_off: usize,
     pub elapsed_ms: u64,
 }
 
@@ -73,6 +77,10 @@ pub fn evaluate_case(
     let a = align::align(reference, &p.cues, align_cfg);
     let v = gate::evaluate(reference, &p.cues, &a, gate_cfg);
     let elapsed_ms = t.elapsed().as_millis() as u64;
+    let placed: Vec<Interval> = a.cues.iter().copied().filter(|c| c.end_ms > c.start_ms).collect();
+    let check = CheckConfig { expected_lag_ms: 0, ..CheckConfig::default() };
+    let stretches_off =
+        verify::scan(reference, &placed, &check).iter().filter(|w| verify::lines_up_elsewhere(w, &check)).count();
     let written = v.should_write();
     let effective = if written { &a.cues } else { &p.cues };
     let (n_truth, within, median_err_ms) = score_cues(effective, &p.truth);
@@ -94,6 +102,7 @@ pub fn evaluate_case(
         prominence: v.prominence,
         score_before: v.score_before,
         score_after: v.score_after,
+        stretches_off,
         elapsed_ms,
     }
 }

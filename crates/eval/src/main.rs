@@ -10,7 +10,7 @@ use subsyncer_core::{AlignConfig, GateConfig};
 use subsyncer_eval::perturb::Kind;
 use subsyncer_eval::report::{summarize, table};
 use subsyncer_eval::synth::NoiseModel;
-use subsyncer_eval::{SyntheticOptions, corpus, embedded, run_synthetic};
+use subsyncer_eval::{SyntheticOptions, corpus, embedded, library, run_synthetic};
 
 #[derive(Parser)]
 #[command(name = "subsyncer-eval", about = "Evaluate subsyncer alignment quality")]
@@ -113,6 +113,31 @@ enum Cmd {
         /// Print each wrong decision.
         #[arg(long)]
         show_failures: bool,
+    },
+    /// Real speech timelines from a subsyncer database: the embedded tracks
+    /// the check accepted, perturbed, are aligned against their audio.
+    Library {
+        /// A subsyncer.db (opened read-only).
+        db: PathBuf,
+        /// Perturbations per (track, kind).
+        #[arg(long, default_value_t = 1)]
+        repeats: u64,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        /// Use at most this many tracks, spread over the library.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Diagnose one video instead: the first whose path contains this.
+        #[arg(long)]
+        video: Option<String>,
+        /// With --video: sync this subtitle file instead of the cached track.
+        #[arg(long)]
+        subtitle: Option<PathBuf>,
+        /// With --video: perturb it like this first (seeded by --seed).
+        #[arg(long)]
+        perturb: Option<String>,
+        #[command(flatten)]
+        tuning: Tuning,
     },
     /// Real corpus: a folder of videos with known-good subtitles next to them.
     Corpus {
@@ -334,6 +359,39 @@ fn main() -> Result<()> {
                             .collect::<Vec<_>>()
                     );
                 }
+            }
+        }
+        Cmd::Library { db, repeats, seed, limit, video, subtitle, perturb, tuning } => {
+            let lib = library::Library::open(&db)?;
+            if let Some(like) = video {
+                let (a, g) = configs(&tuning);
+                let p = match perturb {
+                    Some(k) => Some((Kind::parse(&k).ok_or_else(|| anyhow::anyhow!("unknown kind {k:?}"))?, seed)),
+                    None => None,
+                };
+                return library::diagnose(&lib, &like, subtitle.as_deref(), p, &a, &g);
+            }
+            let cases = lib.accepted_tracks()?;
+            eprintln!("{} accepted tracks with speech timelines", cases.len());
+            let mut kinds = kinds(&tuning)?;
+            if tuning.kinds.is_empty() {
+                kinds.extend(Kind::DRIFTS);
+            }
+            let opts = library::LibraryOptions {
+                kinds,
+                repeats,
+                seed,
+                limit,
+                threads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
+            };
+            let mut rows = Vec::new();
+            for (name, a, g) in methods(&tuning) {
+                let results = library::run(&cases, &opts, &a, &g);
+                print(&tuning, name, &results);
+                rows.extend(summarize(name, &results));
+            }
+            if !tuning.json {
+                print!("{}", table(&rows));
             }
         }
         Cmd::Corpus { dir, repeats, reference, baselines, seed, data_dir, tuning } => {
