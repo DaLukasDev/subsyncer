@@ -135,6 +135,12 @@ pub struct SyncReport {
     pub max_shift_ms: i64,
     /// Dialogue lines the result hides: content the video doesn't have.
     pub hidden_cues: usize,
+    /// Where each two-minute stretch of the result lines up with the
+    /// reference on its own: `offset_ms` 0 is where the result put it, and
+    /// `start_ms` is video time. Single stretches are noisy, but one that
+    /// lines up clearly elsewhere points at a part the result gets wrong.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub stretches: Vec<SampleCheck>,
     pub dry_run: bool,
     pub written: Option<PathBuf>,
     pub backup: Option<PathBuf>,
@@ -261,6 +267,7 @@ impl Engine {
         report.reference = Some(reference.label.clone());
         let t = Instant::now();
         let mut result = pipeline::sync(&file, &reference.timeline, &self.settings.align, &self.settings.gate);
+        let mut fallback: Option<Timeline> = None;
         debug!(elapsed_ms = t.elapsed().as_millis() as u64, "aligned");
         // A split result relies on the embedded track's timing in each
         // segment's region; the samples may not have covered those.
@@ -290,9 +297,16 @@ impl Engine {
                 };
                 report.reference = Some(label);
                 result = pipeline::sync(&file, &tl, &self.settings.align, &self.settings.gate);
+                fallback = Some(tl);
             }
         }
         let v = &result.verdict;
+        if matches!(v.outcome, Outcome::Synced | Outcome::LowConfidence) {
+            let placed: Vec<Interval> =
+                result.alignment.cues.iter().copied().filter(|c| c.end_ms > c.start_ms).collect();
+            let cfg = CheckConfig { expected_lag_ms: 0, ..self.settings.check.clone() };
+            report.stretches = verify::scan(fallback.as_ref().unwrap_or(&reference.timeline), &placed, &cfg);
+        }
         report.outcome = Some(v.outcome);
         report.reason = v.reason.clone();
         if let Some(hint) = search_edge_hint(v, self.settings.align.max_offset_ms) {

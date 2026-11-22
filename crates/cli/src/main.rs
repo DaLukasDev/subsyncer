@@ -8,6 +8,7 @@ use subsyncer::cache::Cache;
 use subsyncer::config::GlobalOpts;
 use subsyncer::engine::{Engine, ReferenceMode, SyncReport, SyncRequest};
 use subsyncer_core::Outcome;
+use subsyncer_core::verify::{self, CheckConfig};
 use tracing::warn;
 
 #[derive(Parser)]
@@ -252,6 +253,17 @@ fn print_report(r: &SyncReport) {
         }
         if r.hidden_cues > 0 {
             println!("  {} lines hidden: the video doesn't have that part", r.hidden_cues);
+        }
+        let check = CheckConfig { expected_lag_ms: 0, ..CheckConfig::default() };
+        for w in r.stretches.iter().filter(|w| verify::lines_up_elsewhere(w, &check)) {
+            let s = w.start_ms.max(0) / 1000;
+            println!(
+                "  the two minutes from {}:{:02} line up {:.2}s {} on their own",
+                s / 60,
+                s % 60,
+                w.offset_ms.abs() as f64 / 1000.0,
+                if w.offset_ms > 0 { "later" } else { "earlier" }
+            );
         }
     }
     if let Some(ec) = &r.embedded_check {
