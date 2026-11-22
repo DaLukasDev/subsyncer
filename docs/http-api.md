@@ -119,7 +119,7 @@ Recent jobs, newest first: `{"jobs": [...], "next_before_id": 1275}`.
 
 ## `GET /healthz`
 
-`{"status": "ok", "version": "0.2.0", "queued": 0, "running": 0, "workers": 1}`.
+`{"status": "ok", "version": "0.2.1", "queued": 0, "running": 0, "workers": 1}`.
 No auth. `subsyncer health` calls it for container healthchecks.
 
 ## `GET /metrics`
